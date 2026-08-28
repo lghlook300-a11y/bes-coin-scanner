@@ -1,11 +1,11 @@
 {
   "engine": "BES V4.9.1",
-  "updated_at": "2026-08-28T10:09:00.361968Z",
+  "updated_at": "2026-08-28T22:23:50.878721Z",
   "source": "Upbit official public REST API",
   "market_count": 277,
   "scanned_count": 163,
   "excluded_count": 114,
-  "active_count": 87,
+  "active_count": 88,
   "fail_excluded_count": 1,
   "candidates": [
     {
@@ -73,6 +73,38 @@
       }
     },
     {
+      "market": "KRW-BEAM",
+      "symbol": "BEAM",
+      "stage": "CONFIRM 대기",
+      "latest_signal": "A",
+      "signal_time": "2026-08-28T12:00:00Z",
+      "signal_price": 1.78,
+      "a_base": 1.78,
+      "b_resistance": 2.33,
+      "daily_bull_s": false,
+      "daily_bear_warning": false,
+      "bars": {
+        "1d": 599,
+        "4h": 599
+      }
+    },
+    {
+      "market": "KRW-BLUR",
+      "symbol": "BLUR",
+      "stage": "CONFIRM 대기",
+      "latest_signal": "A",
+      "signal_time": "2026-08-28T12:00:00Z",
+      "signal_price": 18.0,
+      "a_base": 18.0,
+      "b_resistance": 24.0,
+      "daily_bull_s": false,
+      "daily_bear_warning": false,
+      "bars": {
+        "1d": 599,
+        "4h": 599
+      }
+    },
+    {
       "market": "KRW-BOUNTY",
       "symbol": "BOUNTY",
       "stage": "CONFIRM 대기",
@@ -81,6 +113,22 @@
       "signal_price": 13.5,
       "a_base": 13.5,
       "b_resistance": 17.3,
+      "daily_bull_s": false,
+      "daily_bear_warning": false,
+      "bars": {
+        "1d": 599,
+        "4h": 599
+      }
+    },
+    {
+      "market": "KRW-CBK",
+      "symbol": "CBK",
+      "stage": "CONFIRM 대기",
+      "latest_signal": "A",
+      "signal_time": "2026-08-28T08:00:00Z",
+      "signal_price": 210.0,
+      "a_base": 210.0,
+      "b_resistance": 264.0,
       "daily_bull_s": false,
       "daily_bear_warning": false,
       "bars": {
@@ -137,6 +185,22 @@
       }
     },
     {
+      "market": "KRW-CTC",
+      "symbol": "CTC",
+      "stage": "CONFIRM 대기",
+      "latest_signal": "A",
+      "signal_time": "2026-08-28T08:00:00Z",
+      "signal_price": 89.3,
+      "a_base": 89.3,
+      "b_resistance": 145.0,
+      "daily_bull_s": false,
+      "daily_bear_warning": false,
+      "bars": {
+        "1d": 599,
+        "4h": 599
+      }
+    },
+    {
       "market": "KRW-CVC",
       "symbol": "CVC",
       "stage": "CONFIRM 대기",
@@ -153,6 +217,22 @@
       }
     },
     {
+      "market": "KRW-DEEP",
+      "symbol": "DEEP",
+      "stage": "CONFIRM 대기",
+      "latest_signal": "A",
+      "signal_time": "2026-08-28T12:00:00Z",
+      "signal_price": 17.3,
+      "a_base": 17.3,
+      "b_resistance": 20.6,
+      "daily_bull_s": false,
+      "daily_bear_warning": false,
+      "bars": {
+        "1d": 493,
+        "4h": 599
+      }
+    },
+    {
       "market": "KRW-DKA",
       "symbol": "DKA",
       "stage": "CONFIRM 대기",
@@ -161,6 +241,70 @@
       "signal_price": 4.01,
       "a_base": 4.01,
       "b_resistance": 5.05,
+      "daily_bull_s": false,
+      "daily_bear_warning": false,
+      "bars": {
+        "1d": 599,
+        "4h": 599
+      }
+    },
+    {
+      "market": "KRW-DOT",
+      "symbol": "DOT",
+      "stage": "CONFIRM 대기",
+      "latest_signal": "A",
+      "signal_time": "2026-08-28T16:00:00Z",
+      "signal_price": 1021.0,
+      "a_base": 1021.0,
+      "b_resistance": 1419.0,
+      "daily_bull_s": false,
+      "daily_bear_warning": false,
+      "bars": {
+        "1d": 599,
+        "4h": 599
+      }
+    },
+    {
+      "market": "KRW-ETC",
+      "symbol": "ETC",
+      "stage": "CONFIRM 대기",
+      "latest_signal": "A",
+      "signal_time": "2026-08-28T12:00:00Z",
+      "signal_price": 8455.0,
+      "a_base": 8455.0,
+      "b_resistance": 12530.0,
+      "daily_bull_s": false,
+      "daily_bear_warning": false,
+      "bars": {
+        "1d": 599,
+        "4h": 599
+      }
+    },
+    {
+      "market": "KRW-FCT2",
+      "symbol": "FCT2",
+      "stage": "CONFIRM 대기",
+      "latest_signal": "A",
+      "signal_time": "2026-08-28T12:00:00Z",
+      "signal_price": 8.2,
+      "a_base": 8.2,
+      "b_resistance": 10.5,
+      "daily_bull_s": false,
+      "daily_bear_warning": false,
+      "bars": {
+        "1d": 599,
+        "4h": 599
+      }
+    },
+    {
+      "market": "KRW-GAME2",
+      "symbol": "GAME2",
+      "stage": "CONFIRM 대기",
+      "latest_signal": "A",
+      "signal_time": "2026-08-28T12:00:00Z",
+      "signal_price": 0.915,
+      "a_base": 0.915,
+      "b_resistance": 1.18,
       "daily_bull_s": false,
       "daily_bear_warning": false,
       "bars": {
@@ -217,6 +361,54 @@
       }
     },
     {
+      "market": "KRW-IMX",
+      "symbol": "IMX",
+      "stage": "CONFIRM 대기",
+      "latest_signal": "A",
+      "signal_time": "2026-08-28T12:00:00Z",
+      "signal_price": 131.0,
+      "a_base": 131.0,
+      "b_resistance": 188.0,
+      "daily_bull_s": false,
+      "daily_bear_warning": false,
+      "bars": {
+        "1d": 599,
+        "4h": 599
+      }
+    },
+    {
+      "market": "KRW-KNC",
+      "symbol": "KNC",
+      "stage": "CONFIRM 대기",
+      "latest_signal": "A",
+      "signal_time": "2026-08-28T12:00:00Z",
+      "signal_price": 138.0,
+      "a_base": 138.0,
+      "b_resistance": 171.0,
+      "daily_bull_s": false,
+      "daily_bear_warning": false,
+      "bars": {
+        "1d": 599,
+        "4h": 599
+      }
+    },
+    {
+      "market": "KRW-LPT",
+      "symbol": "LPT",
+      "stage": "CONFIRM 대기",
+      "latest_signal": "A",
+      "signal_time": "2026-08-28T12:00:00Z",
+      "signal_price": 1631.0,
+      "a_base": 1631.0,
+      "b_resistance": 2175.0,
+      "daily_bull_s": false,
+      "daily_bear_warning": false,
+      "bars": {
+        "1d": 455,
+        "4h": 599
+      }
+    },
+    {
       "market": "KRW-MANA",
       "symbol": "MANA",
       "stage": "CONFIRM 대기",
@@ -249,6 +441,54 @@
       }
     },
     {
+      "market": "KRW-MED",
+      "symbol": "MED",
+      "stage": "CONFIRM 대기",
+      "latest_signal": "A",
+      "signal_time": "2026-08-28T12:00:00Z",
+      "signal_price": 1.66,
+      "a_base": 1.66,
+      "b_resistance": 2.12,
+      "daily_bull_s": false,
+      "daily_bear_warning": false,
+      "bars": {
+        "1d": 599,
+        "4h": 599
+      }
+    },
+    {
+      "market": "KRW-MEW",
+      "symbol": "MEW",
+      "stage": "CONFIRM 대기",
+      "latest_signal": "A",
+      "signal_time": "2026-08-28T12:00:00Z",
+      "signal_price": 0.441,
+      "a_base": 0.441,
+      "b_resistance": 0.69,
+      "daily_bull_s": false,
+      "daily_bear_warning": false,
+      "bars": {
+        "1d": 599,
+        "4h": 599
+      }
+    },
+    {
+      "market": "KRW-MOC",
+      "symbol": "MOC",
+      "stage": "CONFIRM 대기",
+      "latest_signal": "A",
+      "signal_time": "2026-08-28T12:00:00Z",
+      "signal_price": 20.5,
+      "a_base": 20.5,
+      "b_resistance": 27.0,
+      "daily_bull_s": false,
+      "daily_bear_warning": false,
+      "bars": {
+        "1d": 599,
+        "4h": 599
+      }
+    },
+    {
       "market": "KRW-MTL",
       "symbol": "MTL",
       "stage": "CONFIRM 대기",
@@ -265,6 +505,22 @@
       }
     },
     {
+      "market": "KRW-NEWT",
+      "symbol": "NEWT",
+      "stage": "CONFIRM 대기",
+      "latest_signal": "A",
+      "signal_time": "2026-08-28T12:00:00Z",
+      "signal_price": 49.2,
+      "a_base": 49.2,
+      "b_resistance": 66.0,
+      "daily_bull_s": false,
+      "daily_bear_warning": false,
+      "bars": {
+        "1d": 430,
+        "4h": 599
+      }
+    },
+    {
       "market": "KRW-NXPC",
       "symbol": "NXPC",
       "stage": "CONFIRM 대기",
@@ -277,6 +533,54 @@
       "daily_bear_warning": false,
       "bars": {
         "1d": 470,
+        "4h": 599
+      }
+    },
+    {
+      "market": "KRW-ONDO",
+      "symbol": "ONDO",
+      "stage": "CONFIRM 대기",
+      "latest_signal": "A",
+      "signal_time": "2026-08-28T12:00:00Z",
+      "signal_price": 446.0,
+      "a_base": 446.0,
+      "b_resistance": 548.0,
+      "daily_bull_s": false,
+      "daily_bear_warning": false,
+      "bars": {
+        "1d": 599,
+        "4h": 599
+      }
+    },
+    {
+      "market": "KRW-PENDLE",
+      "symbol": "PENDLE",
+      "stage": "CONFIRM 대기",
+      "latest_signal": "A",
+      "signal_time": "2026-08-28T12:00:00Z",
+      "signal_price": 1774.0,
+      "a_base": 1774.0,
+      "b_resistance": 2719.0,
+      "daily_bull_s": true,
+      "daily_bear_warning": false,
+      "bars": {
+        "1d": 599,
+        "4h": 599
+      }
+    },
+    {
+      "market": "KRW-POKT",
+      "symbol": "POKT",
+      "stage": "CONFIRM 대기",
+      "latest_signal": "A",
+      "signal_time": "2026-08-28T12:00:00Z",
+      "signal_price": 8.9,
+      "a_base": 8.9,
+      "b_resistance": 10.9,
+      "daily_bull_s": false,
+      "daily_bear_warning": false,
+      "bars": {
+        "1d": 455,
         "4h": 599
       }
     },
@@ -313,6 +617,22 @@
       }
     },
     {
+      "market": "KRW-SAFE",
+      "symbol": "SAFE",
+      "stage": "CONFIRM 대기",
+      "latest_signal": "A",
+      "signal_time": "2026-08-03T00:00:00Z",
+      "signal_price": 114.0,
+      "a_base": 114.0,
+      "b_resistance": 142.0,
+      "daily_bull_s": false,
+      "daily_bear_warning": false,
+      "bars": {
+        "1d": 599,
+        "4h": 599
+      }
+    },
+    {
       "market": "KRW-SAHARA",
       "symbol": "SAHARA",
       "stage": "CONFIRM 대기",
@@ -325,6 +645,38 @@
       "daily_bear_warning": false,
       "bars": {
         "1d": 428,
+        "4h": 599
+      }
+    },
+    {
+      "market": "KRW-SC",
+      "symbol": "SC",
+      "stage": "CONFIRM 대기",
+      "latest_signal": "A",
+      "signal_time": "2026-08-28T12:00:00Z",
+      "signal_price": 0.62,
+      "a_base": 0.62,
+      "b_resistance": 1.22,
+      "daily_bull_s": false,
+      "daily_bear_warning": false,
+      "bars": {
+        "1d": 599,
+        "4h": 599
+      }
+    },
+    {
+      "market": "KRW-SEI",
+      "symbol": "SEI",
+      "stage": "CONFIRM 대기",
+      "latest_signal": "A",
+      "signal_time": "2026-08-28T16:00:00Z",
+      "signal_price": 53.4,
+      "a_base": 53.4,
+      "b_resistance": 70.2,
+      "daily_bull_s": false,
+      "daily_bear_warning": false,
+      "bars": {
+        "1d": 599,
         "4h": 599
       }
     },
@@ -357,6 +709,22 @@
       "daily_bear_warning": false,
       "bars": {
         "1d": 457,
+        "4h": 599
+      }
+    },
+    {
+      "market": "KRW-SUI",
+      "symbol": "SUI",
+      "stage": "CONFIRM 대기",
+      "latest_signal": "A",
+      "signal_time": "2026-08-28T12:00:00Z",
+      "signal_price": 897.0,
+      "a_base": 897.0,
+      "b_resistance": 1311.0,
+      "daily_bull_s": false,
+      "daily_bear_warning": false,
+      "bars": {
+        "1d": 599,
         "4h": 599
       }
     },
@@ -457,6 +825,38 @@
       }
     },
     {
+      "market": "KRW-XLM",
+      "symbol": "XLM",
+      "stage": "CONFIRM 대기",
+      "latest_signal": "A",
+      "signal_time": "2026-08-28T12:00:00Z",
+      "signal_price": 214.0,
+      "a_base": 214.0,
+      "b_resistance": 306.0,
+      "daily_bull_s": false,
+      "daily_bear_warning": false,
+      "bars": {
+        "1d": 599,
+        "4h": 599
+      }
+    },
+    {
+      "market": "KRW-XRP",
+      "symbol": "XRP",
+      "stage": "CONFIRM 대기",
+      "latest_signal": "A",
+      "signal_time": "2026-08-28T12:00:00Z",
+      "signal_price": 1392.0,
+      "a_base": 1392.0,
+      "b_resistance": 2331.0,
+      "daily_bull_s": false,
+      "daily_bear_warning": false,
+      "bars": {
+        "1d": 599,
+        "4h": 599
+      }
+    },
+    {
       "market": "KRW-ZETA",
       "symbol": "ZETA",
       "stage": "CONFIRM 대기",
@@ -512,7 +912,7 @@
       "signal_time": "2026-08-20T00:00:00Z",
       "signal_price": 120.0,
       "a_base": 120.0,
-      "b_resistance": 158.0,
+      "b_resistance": 167.0,
       "daily_bull_s": false,
       "daily_bear_warning": false,
       "bars": {
@@ -537,22 +937,6 @@
       }
     },
     {
-      "market": "KRW-BEAM",
-      "symbol": "BEAM",
-      "stage": "ABC 진행",
-      "latest_signal": "PRE-A",
-      "signal_time": "2026-08-20T04:00:00Z",
-      "signal_price": 1.78,
-      "a_base": 1.78,
-      "b_resistance": 2.33,
-      "daily_bull_s": false,
-      "daily_bear_warning": false,
-      "bars": {
-        "1d": 599,
-        "4h": 599
-      }
-    },
-    {
       "market": "KRW-BLAST",
       "symbol": "BLAST",
       "stage": "ABC 진행",
@@ -561,22 +945,6 @@
       "signal_price": 0.32,
       "a_base": 0.32,
       "b_resistance": 0.416,
-      "daily_bull_s": false,
-      "daily_bear_warning": false,
-      "bars": {
-        "1d": 599,
-        "4h": 599
-      }
-    },
-    {
-      "market": "KRW-BLUR",
-      "symbol": "BLUR",
-      "stage": "ABC 진행",
-      "latest_signal": "PRE-A",
-      "signal_time": "2026-08-20T00:00:00Z",
-      "signal_price": 18.0,
-      "a_base": 18.0,
-      "b_resistance": 24.0,
       "daily_bull_s": false,
       "daily_bear_warning": false,
       "bars": {
@@ -617,22 +985,6 @@
       }
     },
     {
-      "market": "KRW-CBK",
-      "symbol": "CBK",
-      "stage": "ABC 진행",
-      "latest_signal": "PRE-A",
-      "signal_time": "2026-08-21T04:00:00Z",
-      "signal_price": 210.0,
-      "a_base": 210.0,
-      "b_resistance": 264.0,
-      "daily_bull_s": false,
-      "daily_bear_warning": false,
-      "bars": {
-        "1d": 599,
-        "4h": 599
-      }
-    },
-    {
       "market": "KRW-CELO",
       "symbol": "CELO",
       "stage": "ABC 진행",
@@ -641,54 +993,6 @@
       "signal_price": 80.5,
       "a_base": 80.5,
       "b_resistance": 111.0,
-      "daily_bull_s": false,
-      "daily_bear_warning": false,
-      "bars": {
-        "1d": 599,
-        "4h": 599
-      }
-    },
-    {
-      "market": "KRW-CTC",
-      "symbol": "CTC",
-      "stage": "ABC 진행",
-      "latest_signal": "PRE-A",
-      "signal_time": "2026-08-20T00:00:00Z",
-      "signal_price": 89.3,
-      "a_base": 89.3,
-      "b_resistance": 145.0,
-      "daily_bull_s": false,
-      "daily_bear_warning": false,
-      "bars": {
-        "1d": 599,
-        "4h": 599
-      }
-    },
-    {
-      "market": "KRW-DEEP",
-      "symbol": "DEEP",
-      "stage": "ABC 진행",
-      "latest_signal": "PRE-A",
-      "signal_time": "2026-08-25T04:00:00Z",
-      "signal_price": 17.3,
-      "a_base": 17.3,
-      "b_resistance": 20.6,
-      "daily_bull_s": false,
-      "daily_bear_warning": false,
-      "bars": {
-        "1d": 493,
-        "4h": 599
-      }
-    },
-    {
-      "market": "KRW-DOT",
-      "symbol": "DOT",
-      "stage": "ABC 진행",
-      "latest_signal": "PRE-A",
-      "signal_time": "2026-08-20T00:00:00Z",
-      "signal_price": 1021.0,
-      "a_base": 1021.0,
-      "b_resistance": 1419.0,
       "daily_bull_s": false,
       "daily_bear_warning": false,
       "bars": {
@@ -729,38 +1033,6 @@
       }
     },
     {
-      "market": "KRW-ETC",
-      "symbol": "ETC",
-      "stage": "ABC 진행",
-      "latest_signal": "PRE-A",
-      "signal_time": "2026-08-21T08:00:00Z",
-      "signal_price": 8455.0,
-      "a_base": 8455.0,
-      "b_resistance": 12530.0,
-      "daily_bull_s": false,
-      "daily_bear_warning": false,
-      "bars": {
-        "1d": 599,
-        "4h": 599
-      }
-    },
-    {
-      "market": "KRW-FCT2",
-      "symbol": "FCT2",
-      "stage": "ABC 진행",
-      "latest_signal": "PRE-A",
-      "signal_time": "2026-08-21T12:00:00Z",
-      "signal_price": 8.2,
-      "a_base": 8.2,
-      "b_resistance": 10.5,
-      "daily_bull_s": false,
-      "daily_bear_warning": false,
-      "bars": {
-        "1d": 599,
-        "4h": 599
-      }
-    },
-    {
       "market": "KRW-FIL",
       "symbol": "FIL",
       "stage": "ABC 진행",
@@ -777,22 +1049,6 @@
       }
     },
     {
-      "market": "KRW-GAME2",
-      "symbol": "GAME2",
-      "stage": "ABC 진행",
-      "latest_signal": "PRE-A",
-      "signal_time": "2026-08-21T08:00:00Z",
-      "signal_price": 0.915,
-      "a_base": 0.915,
-      "b_resistance": 1.18,
-      "daily_bull_s": false,
-      "daily_bear_warning": false,
-      "bars": {
-        "1d": 599,
-        "4h": 599
-      }
-    },
-    {
       "market": "KRW-GLM",
       "symbol": "GLM",
       "stage": "ABC 진행",
@@ -800,7 +1056,7 @@
       "signal_time": "2026-08-20T00:00:00Z",
       "signal_price": 119.0,
       "a_base": 119.0,
-      "b_resistance": 155.0,
+      "b_resistance": 161.0,
       "daily_bull_s": false,
       "daily_bear_warning": false,
       "bars": {
@@ -873,22 +1129,6 @@
       }
     },
     {
-      "market": "KRW-IMX",
-      "symbol": "IMX",
-      "stage": "ABC 진행",
-      "latest_signal": "PRE-A",
-      "signal_time": "2026-08-21T12:00:00Z",
-      "signal_price": 131.0,
-      "a_base": 131.0,
-      "b_resistance": 188.0,
-      "daily_bull_s": false,
-      "daily_bear_warning": false,
-      "bars": {
-        "1d": 599,
-        "4h": 599
-      }
-    },
-    {
       "market": "KRW-INJ",
       "symbol": "INJ",
       "stage": "ABC 진행",
@@ -953,38 +1193,6 @@
       }
     },
     {
-      "market": "KRW-KNC",
-      "symbol": "KNC",
-      "stage": "ABC 진행",
-      "latest_signal": "PRE-A",
-      "signal_time": "2026-08-20T16:00:00Z",
-      "signal_price": 138.0,
-      "a_base": 138.0,
-      "b_resistance": 171.0,
-      "daily_bull_s": false,
-      "daily_bear_warning": false,
-      "bars": {
-        "1d": 599,
-        "4h": 599
-      }
-    },
-    {
-      "market": "KRW-LPT",
-      "symbol": "LPT",
-      "stage": "ABC 진행",
-      "latest_signal": "PRE-A",
-      "signal_time": "2026-08-20T00:00:00Z",
-      "signal_price": 1631.0,
-      "a_base": 1631.0,
-      "b_resistance": 2175.0,
-      "daily_bull_s": false,
-      "daily_bear_warning": false,
-      "bars": {
-        "1d": 455,
-        "4h": 599
-      }
-    },
-    {
       "market": "KRW-ME",
       "symbol": "ME",
       "stage": "ABC 진행",
@@ -993,54 +1201,6 @@
       "signal_price": 75.0,
       "a_base": 75.0,
       "b_resistance": 102.0,
-      "daily_bull_s": false,
-      "daily_bear_warning": false,
-      "bars": {
-        "1d": 599,
-        "4h": 599
-      }
-    },
-    {
-      "market": "KRW-MED",
-      "symbol": "MED",
-      "stage": "ABC 진행",
-      "latest_signal": "PRE-A",
-      "signal_time": "2026-08-19T00:00:00Z",
-      "signal_price": 1.66,
-      "a_base": 1.66,
-      "b_resistance": 2.12,
-      "daily_bull_s": false,
-      "daily_bear_warning": false,
-      "bars": {
-        "1d": 599,
-        "4h": 599
-      }
-    },
-    {
-      "market": "KRW-MEW",
-      "symbol": "MEW",
-      "stage": "ABC 진행",
-      "latest_signal": "PRE-A",
-      "signal_time": "2026-08-18T20:00:00Z",
-      "signal_price": 0.441,
-      "a_base": 0.441,
-      "b_resistance": 0.69,
-      "daily_bull_s": false,
-      "daily_bear_warning": false,
-      "bars": {
-        "1d": 599,
-        "4h": 599
-      }
-    },
-    {
-      "market": "KRW-MOC",
-      "symbol": "MOC",
-      "stage": "ABC 진행",
-      "latest_signal": "PRE-A",
-      "signal_time": "2026-08-21T12:00:00Z",
-      "signal_price": 20.5,
-      "a_base": 20.5,
-      "b_resistance": 27.0,
       "daily_bull_s": false,
       "daily_bear_warning": false,
       "bars": {
@@ -1081,38 +1241,6 @@
       }
     },
     {
-      "market": "KRW-NEWT",
-      "symbol": "NEWT",
-      "stage": "ABC 진행",
-      "latest_signal": "PRE-A",
-      "signal_time": "2026-08-20T00:00:00Z",
-      "signal_price": 49.2,
-      "a_base": 49.2,
-      "b_resistance": 66.0,
-      "daily_bull_s": false,
-      "daily_bear_warning": false,
-      "bars": {
-        "1d": 430,
-        "4h": 599
-      }
-    },
-    {
-      "market": "KRW-ONDO",
-      "symbol": "ONDO",
-      "stage": "ABC 진행",
-      "latest_signal": "PRE-A",
-      "signal_time": "2026-08-24T04:00:00Z",
-      "signal_price": 446.0,
-      "a_base": 446.0,
-      "b_resistance": 548.0,
-      "daily_bull_s": false,
-      "daily_bear_warning": false,
-      "bars": {
-        "1d": 599,
-        "4h": 599
-      }
-    },
-    {
       "market": "KRW-ONG",
       "symbol": "ONG",
       "stage": "ABC 진행",
@@ -1129,38 +1257,6 @@
       }
     },
     {
-      "market": "KRW-PENDLE",
-      "symbol": "PENDLE",
-      "stage": "ABC 진행",
-      "latest_signal": "PRE-A",
-      "signal_time": "2026-08-19T00:00:00Z",
-      "signal_price": 1774.0,
-      "a_base": 1774.0,
-      "b_resistance": 2719.0,
-      "daily_bull_s": true,
-      "daily_bear_warning": false,
-      "bars": {
-        "1d": 599,
-        "4h": 599
-      }
-    },
-    {
-      "market": "KRW-POKT",
-      "symbol": "POKT",
-      "stage": "ABC 진행",
-      "latest_signal": "PRE-A",
-      "signal_time": "2026-08-21T12:00:00Z",
-      "signal_price": 8.9,
-      "a_base": 8.9,
-      "b_resistance": 10.9,
-      "daily_bull_s": false,
-      "daily_bear_warning": false,
-      "bars": {
-        "1d": 455,
-        "4h": 599
-      }
-    },
-    {
       "market": "KRW-PUNDIX",
       "symbol": "PUNDIX",
       "stage": "ABC 진행",
@@ -1169,38 +1265,6 @@
       "signal_price": 101.0,
       "a_base": 101.0,
       "b_resistance": 153.0,
-      "daily_bull_s": false,
-      "daily_bear_warning": false,
-      "bars": {
-        "1d": 599,
-        "4h": 599
-      }
-    },
-    {
-      "market": "KRW-SC",
-      "symbol": "SC",
-      "stage": "ABC 진행",
-      "latest_signal": "PRE-A",
-      "signal_time": "2026-08-20T08:00:00Z",
-      "signal_price": 0.62,
-      "a_base": 0.62,
-      "b_resistance": 1.22,
-      "daily_bull_s": false,
-      "daily_bear_warning": false,
-      "bars": {
-        "1d": 599,
-        "4h": 599
-      }
-    },
-    {
-      "market": "KRW-SEI",
-      "symbol": "SEI",
-      "stage": "ABC 진행",
-      "latest_signal": "PRE-A",
-      "signal_time": "2026-08-21T08:00:00Z",
-      "signal_price": 53.4,
-      "a_base": 53.4,
-      "b_resistance": 70.2,
       "daily_bull_s": false,
       "daily_bear_warning": false,
       "bars": {
@@ -1273,22 +1337,6 @@
       }
     },
     {
-      "market": "KRW-SUI",
-      "symbol": "SUI",
-      "stage": "ABC 진행",
-      "latest_signal": "PRE-A",
-      "signal_time": "2026-08-20T00:00:00Z",
-      "signal_price": 897.0,
-      "a_base": 897.0,
-      "b_resistance": 1311.0,
-      "daily_bull_s": false,
-      "daily_bear_warning": false,
-      "bars": {
-        "1d": 599,
-        "4h": 599
-      }
-    },
-    {
       "market": "KRW-TRX",
       "symbol": "TRX",
       "stage": "ABC 진행",
@@ -1313,38 +1361,6 @@
       "signal_price": 6.11,
       "a_base": 6.11,
       "b_resistance": 8.49,
-      "daily_bull_s": false,
-      "daily_bear_warning": false,
-      "bars": {
-        "1d": 599,
-        "4h": 599
-      }
-    },
-    {
-      "market": "KRW-XLM",
-      "symbol": "XLM",
-      "stage": "ABC 진행",
-      "latest_signal": "PRE-A",
-      "signal_time": "2026-08-20T12:00:00Z",
-      "signal_price": 214.0,
-      "a_base": 214.0,
-      "b_resistance": 306.0,
-      "daily_bull_s": false,
-      "daily_bear_warning": false,
-      "bars": {
-        "1d": 599,
-        "4h": 599
-      }
-    },
-    {
-      "market": "KRW-XRP",
-      "symbol": "XRP",
-      "stage": "ABC 진행",
-      "latest_signal": "PRE-A",
-      "signal_time": "2026-08-20T00:00:00Z",
-      "signal_price": 1392.0,
-      "a_base": 1392.0,
-      "b_resistance": 2331.0,
       "daily_bull_s": false,
       "daily_bear_warning": false,
       "bars": {
@@ -1424,7 +1440,7 @@
     },
     {
       "market": "KRW-AI",
-      "reason": "bars 1D=59, 4H=355"
+      "reason": "bars 1D=59, 4H=358"
     },
     {
       "market": "KRW-API3",
@@ -1432,7 +1448,7 @@
     },
     {
       "market": "KRW-ARX",
-      "reason": "bars 1D=66, 4H=397"
+      "reason": "bars 1D=66, 4H=400"
     },
     {
       "market": "KRW-AVNT",
@@ -1448,7 +1464,7 @@
     },
     {
       "market": "KRW-BABY",
-      "reason": "bars 1D=84, 4H=504"
+      "reason": "bars 1D=84, 4H=507"
     },
     {
       "market": "KRW-BARD",
@@ -1472,11 +1488,11 @@
     },
     {
       "market": "KRW-BSB",
-      "reason": "bars 1D=21, 4H=127"
+      "reason": "bars 1D=21, 4H=130"
     },
     {
       "market": "KRW-CAP",
-      "reason": "bars 1D=22, 4H=133"
+      "reason": "bars 1D=22, 4H=136"
     },
     {
       "market": "KRW-CC",
@@ -1488,7 +1504,7 @@
     },
     {
       "market": "KRW-CFX",
-      "reason": "bars 1D=28, 4H=168"
+      "reason": "bars 1D=28, 4H=171"
     },
     {
       "market": "KRW-CHIP",
@@ -1500,7 +1516,7 @@
     },
     {
       "market": "KRW-CRV",
-      "reason": "bars 1D=7, 4H=43"
+      "reason": "bars 1D=7, 4H=46"
     },
     {
       "market": "KRW-CYBER",
@@ -1516,11 +1532,11 @@
     },
     {
       "market": "KRW-DOS",
-      "reason": "bars 1D=17, 4H=103"
+      "reason": "bars 1D=17, 4H=106"
     },
     {
       "market": "KRW-DRV",
-      "reason": "bars 1D=45, 4H=270"
+      "reason": "bars 1D=45, 4H=273"
     },
     {
       "market": "KRW-EDGE",
@@ -1544,11 +1560,11 @@
     },
     {
       "market": "KRW-EUL",
-      "reason": "bars 1D=33, 4H=199"
+      "reason": "bars 1D=33, 4H=202"
     },
     {
       "market": "KRW-EURC",
-      "reason": "bars 1D=0, 4H=1"
+      "reason": "bars 1D=0, 4H=4"
     },
     {
       "market": "KRW-F",
@@ -1568,15 +1584,15 @@
     },
     {
       "market": "KRW-FOLD",
-      "reason": "bars 1D=5, 4H=32"
+      "reason": "bars 1D=5, 4H=35"
     },
     {
       "market": "KRW-GEOD",
-      "reason": "bars 1D=32, 4H=192"
+      "reason": "bars 1D=32, 4H=195"
     },
     {
       "market": "KRW-GRVT",
-      "reason": "bars 1D=23, 4H=138"
+      "reason": "bars 1D=23, 4H=141"
     },
     {
       "market": "KRW-HOLO",
@@ -1584,7 +1600,7 @@
     },
     {
       "market": "KRW-HOME",
-      "reason": "bars 1D=24, 4H=144"
+      "reason": "bars 1D=24, 4H=147"
     },
     {
       "market": "KRW-ICP",
@@ -1596,7 +1612,7 @@
     },
     {
       "market": "KRW-IO",
-      "reason": "bars 1D=91, 4H=546"
+      "reason": "bars 1D=91, 4H=549"
     },
     {
       "market": "KRW-IRYS",
@@ -1616,7 +1632,7 @@
     },
     {
       "market": "KRW-KMNO",
-      "reason": "bars 1D=21, 4H=126"
+      "reason": "bars 1D=21, 4H=129"
     },
     {
       "market": "KRW-LA",
@@ -1628,7 +1644,7 @@
     },
     {
       "market": "KRW-LIT",
-      "reason": "bars 1D=4, 4H=25"
+      "reason": "bars 1D=4, 4H=28"
     },
     {
       "market": "KRW-MEGA",
@@ -1640,7 +1656,7 @@
     },
     {
       "market": "KRW-META2",
-      "reason": "bars 1D=30, 4H=180"
+      "reason": "bars 1D=30, 4H=183"
     },
     {
       "market": "KRW-MIRA",
@@ -1656,15 +1672,15 @@
     },
     {
       "market": "KRW-MORPHO",
-      "reason": "bars 1D=34, 4H=204"
+      "reason": "bars 1D=34, 4H=207"
     },
     {
       "market": "KRW-NCT",
-      "reason": "bars 1D=2, 4H=11"
+      "reason": "bars 1D=2, 4H=14"
     },
     {
       "market": "KRW-O",
-      "reason": "bars 1D=36, 4H=217"
+      "reason": "bars 1D=36, 4H=220"
     },
     {
       "market": "KRW-OP",
@@ -1676,7 +1692,7 @@
     },
     {
       "market": "KRW-OPG",
-      "reason": "bars 1D=52, 4H=313"
+      "reason": "bars 1D=52, 4H=316"
     },
     {
       "market": "KRW-ORDER",
@@ -1696,7 +1712,7 @@
     },
     {
       "market": "KRW-PROM",
-      "reason": "bars 1D=16, 4H=98"
+      "reason": "bars 1D=16, 4H=101"
     },
     {
       "market": "KRW-PROS",
@@ -1712,11 +1728,11 @@
     },
     {
       "market": "KRW-QUID",
-      "reason": "bars 1D=24, 4H=143"
+      "reason": "bars 1D=24, 4H=146"
     },
     {
       "market": "KRW-RE",
-      "reason": "bars 1D=70, 4H=419"
+      "reason": "bars 1D=70, 4H=422"
     },
     {
       "market": "KRW-RED",
@@ -1724,7 +1740,7 @@
     },
     {
       "market": "KRW-RLUSD",
-      "reason": "bars 1D=31, 4H=185"
+      "reason": "bars 1D=31, 4H=188"
     },
     {
       "market": "KRW-SENT",
@@ -1740,7 +1756,7 @@
     },
     {
       "market": "KRW-SLX",
-      "reason": "bars 1D=88, 4H=529"
+      "reason": "bars 1D=88, 4H=532"
     },
     {
       "market": "KRW-SOMI",
@@ -1756,7 +1772,7 @@
     },
     {
       "market": "KRW-SPX",
-      "reason": "bars 1D=73, 4H=439"
+      "reason": "bars 1D=73, 4H=442"
     },
     {
       "market": "KRW-SUN",
@@ -1800,11 +1816,11 @@
     },
     {
       "market": "KRW-USDG",
-      "reason": "bars 1D=29, 4H=147"
+      "reason": "bars 1D=29, 4H=149"
     },
     {
       "market": "KRW-USDS",
-      "reason": "bars 1D=150, 4H=600"
+      "reason": "bars 1D=150, 4H=599"
     },
     {
       "market": "KRW-VVV",
