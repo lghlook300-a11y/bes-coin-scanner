@@ -1,45 +1,109 @@
 {
   "engine": "BES Momentum V1",
-  "updated_at": "2026-08-29T11:19:22.822808Z",
+  "updated_at": "2026-08-29T12:19:19.719932Z",
   "source": "Upbit official public REST API",
   "market_count": 277,
-  "scanned_count": 274,
-  "excluded_count": 3,
-  "active_count": 1,
-  "actionable_count": 0,
+  "scanned_count": 277,
+  "excluded_count": 0,
+  "active_count": 3,
+  "actionable_count": 3,
   "risk_excluded_count": 8,
   "candidates": [
     {
-      "market": "KRW-PROM",
-      "symbol": "PROM",
-      "current_price": 7305.0,
-      "trade_value_24h": 22455948289.179127,
-      "change_24h": 3.54358611,
-      "change_1h": 5.395683453237421,
-      "change_4h": 6.934306569343063,
-      "change_12h": 3.4604519774011244,
-      "value_ratio_1h": 2.3101126204368754,
-      "value_ratio_4h": 1.0978102770902172,
+      "market": "KRW-ZKP",
+      "symbol": "ZKP",
+      "current_price": 63.7,
+      "trade_value_24h": 1201340096.608239,
+      "change_24h": 6.521739129999999,
+      "change_1h": 3.262642740619892,
+      "change_4h": 2.9268292682926855,
+      "change_12h": 5.852842809364556,
+      "value_ratio_1h": 3.4123935101850247,
+      "value_ratio_4h": 2.0639368941295175,
       "breakout_20h": true,
-      "distance_to_high_20h": -0.614334470989761,
+      "distance_to_high_20h": -1.7377567140600225,
       "above_ema20": true,
-      "close_position": 0.8152173913043478,
-      "upper_wick_ratio": 0.18478260869565216,
-      "signal_candle_time": "2026-08-29T10:00:00Z",
-      "stage": "강한 상승",
-      "score": 94,
-      "relative_strength_percentile": 97.4,
+      "close_position": 0.8928571428571415,
+      "upper_wick_ratio": 0.1071428571428585,
+      "signal_candle_time": "2026-08-29T11:00:00Z",
+      "stage": "초기 포착",
+      "score": 82,
+      "relative_strength_percentile": 98.4,
       "score_components": {
-        "acceleration": 30.0,
-        "capital_flow": 23.7,
+        "acceleration": 20.4,
+        "capital_flow": 25.0,
         "breakout": 20.0,
-        "relative_strength": 14.6,
-        "liquidity": 6.1,
+        "relative_strength": 14.8,
+        "liquidity": 2.2,
         "wick_penalty": 0.0
       },
-      "first_detected_at": "2026-08-29T11:19:22.822808Z",
-      "first_detected_price": 7305.0,
-      "action": "눌림 대기"
+      "first_detected_at": "2026-08-29T12:19:19.719932Z",
+      "first_detected_price": 63.7,
+      "action": "매수 검토"
+    },
+    {
+      "market": "KRW-BSB",
+      "symbol": "BSB",
+      "current_price": 149.0,
+      "trade_value_24h": 1075411359.9739754,
+      "change_24h": 7.194244599999999,
+      "change_1h": 1.3513513513513598,
+      "change_4h": 2.7397260273972712,
+      "change_12h": 7.913669064748197,
+      "value_ratio_1h": 3.3976311043981817,
+      "value_ratio_4h": 2.932947562288764,
+      "breakout_20h": true,
+      "distance_to_high_20h": -0.6666666666666667,
+      "above_ema20": true,
+      "close_position": 0.75,
+      "upper_wick_ratio": 0.25,
+      "signal_candle_time": "2026-08-29T11:00:00Z",
+      "stage": "초기 포착",
+      "score": 75,
+      "relative_strength_percentile": 98.6,
+      "score_components": {
+        "acceleration": 13.5,
+        "capital_flow": 25.0,
+        "breakout": 20.0,
+        "relative_strength": 14.8,
+        "liquidity": 2.1,
+        "wick_penalty": 0.0
+      },
+      "first_detected_at": "2026-08-29T12:19:19.719932Z",
+      "first_detected_price": 149.0,
+      "action": "매수 검토"
+    },
+    {
+      "market": "KRW-ENSO",
+      "symbol": "ENSO",
+      "current_price": 1251.0,
+      "trade_value_24h": 2096961949.7054582,
+      "change_24h": 3.8174273899999998,
+      "change_1h": 1.7988552739165886,
+      "change_4h": 4.096989966555187,
+      "change_12h": 3.319502074688807,
+      "value_ratio_1h": 1.115106475896495,
+      "value_ratio_4h": 1.3516387579609712,
+      "breakout_20h": true,
+      "distance_to_high_20h": -0.1606425702811245,
+      "above_ema20": true,
+      "close_position": 0.95,
+      "upper_wick_ratio": 0.05,
+      "signal_candle_time": "2026-08-29T11:00:00Z",
+      "stage": "초기 포착",
+      "score": 65,
+      "relative_strength_percentile": 96.7,
+      "score_components": {
+        "acceleration": 15.0,
+        "capital_flow": 12.2,
+        "breakout": 20.0,
+        "relative_strength": 14.5,
+        "liquidity": 3.0,
+        "wick_penalty": 0.0
+      },
+      "first_detected_at": "2026-08-29T12:19:19.719932Z",
+      "first_detected_price": 1251.0,
+      "action": "매수 검토"
     }
   ],
   "risk_exclusions": [
@@ -76,18 +140,5 @@
       "reason": "UPBIT_WARNING"
     }
   ],
-  "exclusions": [
-    {
-      "market": "KRW-AVAX",
-      "reason": "HTTPError: HTTP Error 429: Too Many Requests"
-    },
-    {
-      "market": "KRW-ARX",
-      "reason": "HTTPError: HTTP Error 429: Too Many Requests"
-    },
-    {
-      "market": "KRW-ATOM",
-      "reason": "HTTPError: HTTP Error 429: Too Many Requests"
-    }
-  ]
+  "exclusions": []
 }
