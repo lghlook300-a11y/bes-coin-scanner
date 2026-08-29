@@ -1,44 +1,44 @@
 {
   "engine": "BES Momentum V1",
-  "updated_at": "2026-08-29T10:20:20.381805Z",
+  "updated_at": "2026-08-29T11:19:22.822808Z",
   "source": "Upbit official public REST API",
   "market_count": 277,
-  "scanned_count": 276,
-  "excluded_count": 1,
+  "scanned_count": 274,
+  "excluded_count": 3,
   "active_count": 1,
   "actionable_count": 0,
   "risk_excluded_count": 8,
   "candidates": [
     {
-      "market": "KRW-O",
-      "symbol": "O",
-      "current_price": 728.0,
-      "trade_value_24h": 8610351688.013632,
-      "change_24h": 15.923566880000001,
-      "change_1h": 3.370786516853941,
-      "change_4h": 4.101838755304099,
-      "change_12h": 18.90145395799676,
-      "value_ratio_1h": 4.942954127034088,
-      "value_ratio_4h": 2.476216797264073,
+      "market": "KRW-PROM",
+      "symbol": "PROM",
+      "current_price": 7305.0,
+      "trade_value_24h": 22455948289.179127,
+      "change_24h": 3.54358611,
+      "change_1h": 5.395683453237421,
+      "change_4h": 6.934306569343063,
+      "change_12h": 3.4604519774011244,
+      "value_ratio_1h": 2.3101126204368754,
+      "value_ratio_4h": 1.0978102770902172,
       "breakout_20h": true,
-      "distance_to_high_20h": -1.766304347826087,
+      "distance_to_high_20h": -0.614334470989761,
       "above_ema20": true,
-      "close_position": 0.967741935483871,
-      "upper_wick_ratio": 0.03225806451612903,
-      "signal_candle_time": "2026-08-29T09:00:00Z",
+      "close_position": 0.8152173913043478,
+      "upper_wick_ratio": 0.18478260869565216,
+      "signal_candle_time": "2026-08-29T10:00:00Z",
       "stage": "강한 상승",
       "score": 94,
-      "relative_strength_percentile": 99.8,
+      "relative_strength_percentile": 97.4,
       "score_components": {
-        "acceleration": 29.1,
-        "capital_flow": 25.0,
+        "acceleration": 30.0,
+        "capital_flow": 23.7,
         "breakout": 20.0,
-        "relative_strength": 15.0,
-        "liquidity": 4.8,
+        "relative_strength": 14.6,
+        "liquidity": 6.1,
         "wick_penalty": 0.0
       },
-      "first_detected_at": "2026-08-29T09:19:27.265678Z",
-      "first_detected_price": 714.0,
+      "first_detected_at": "2026-08-29T11:19:22.822808Z",
+      "first_detected_price": 7305.0,
       "action": "눌림 대기"
     }
   ],
@@ -78,8 +78,16 @@
   ],
   "exclusions": [
     {
-      "market": "KRW-EURC",
-      "reason": "ValueError: hourly bars=29"
+      "market": "KRW-AVAX",
+      "reason": "HTTPError: HTTP Error 429: Too Many Requests"
+    },
+    {
+      "market": "KRW-ARX",
+      "reason": "HTTPError: HTTP Error 429: Too Many Requests"
+    },
+    {
+      "market": "KRW-ATOM",
+      "reason": "HTTPError: HTTP Error 429: Too Many Requests"
     }
   ]
 }
