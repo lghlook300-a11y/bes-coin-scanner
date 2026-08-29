@@ -1,47 +1,14 @@
 {
   "engine": "BES Momentum V1",
-  "updated_at": "2026-08-29T22:19:20.870749Z",
+  "updated_at": "2026-08-29T23:19:17.038011Z",
   "source": "Upbit official public REST API",
   "market_count": 277,
   "scanned_count": 277,
   "excluded_count": 0,
-  "active_count": 1,
-  "actionable_count": 1,
+  "active_count": 0,
+  "actionable_count": 0,
   "risk_excluded_count": 8,
-  "candidates": [
-    {
-      "market": "KRW-PUMP",
-      "symbol": "PUMP",
-      "current_price": 6.94,
-      "trade_value_24h": 2210193709.110205,
-      "change_24h": 8.268330729999999,
-      "change_1h": 3.26894502228825,
-      "change_4h": 4.5112781954887105,
-      "change_12h": 6.7588325652841785,
-      "value_ratio_1h": 5.339284033828432,
-      "value_ratio_4h": 1.799838338143602,
-      "breakout_20h": true,
-      "distance_to_high_20h": -2.158273381294969,
-      "above_ema20": true,
-      "close_position": 0.5641025641025639,
-      "upper_wick_ratio": 0.43589743589743607,
-      "signal_candle_time": "2026-08-29T21:00:00Z",
-      "stage": "초기 포착",
-      "score": 86,
-      "relative_strength_percentile": 98.6,
-      "score_components": {
-        "acceleration": 23.2,
-        "capital_flow": 25.0,
-        "breakout": 20.0,
-        "relative_strength": 14.8,
-        "liquidity": 3.0,
-        "wick_penalty": 0.0
-      },
-      "first_detected_at": "2026-08-29T22:19:20.870749Z",
-      "first_detected_price": 6.94,
-      "action": "매수 검토"
-    }
-  ],
+  "candidates": [],
   "risk_exclusions": [
     {
       "market": "KRW-BONK",
