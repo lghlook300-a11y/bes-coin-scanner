@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Upbit KRW hourly momentum scanner.
+"""Bithumb KRW 15-minute compression-breakout scanner.
 
 The former ABC-only scanner is preserved in bes_core.py for comparison.
 This production scanner ranks early price acceleration, trading-value expansion,
@@ -20,19 +20,19 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-API = "https://api.upbit.com/v1"
-NOTICE_API = "https://api-manager.upbit.com/api/v1/notices"
+API = "https://api.bithumb.com/v1"
 OUT = Path("data/latest.json")
 STABLE_SYMBOLS = {"USDT", "USDC", "DAI", "TUSD", "FDUSD", "USDE", "PYUSD"}
-MIN_TRADE_VALUE_24H = 1_000_000_000
+MIN_TRADE_VALUE_24H = 500_000_000
 MAX_RESULTS = 20
+TRACK_HOURS = 12
 
 
 def api_get(path: str, params: dict[str, Any] | None = None) -> Any:
     url = f"{API}{path}"
     if params:
         url += "?" + urlencode(params)
-    request = Request(url, headers={"User-Agent": "bes-momentum-scanner/2.0"})
+    request = Request(url, headers={"User-Agent": "bes-bithumb-breakout/3.0"})
     for attempt in range(6):
         try:
             with urlopen(request, timeout=30) as response:
@@ -47,25 +47,6 @@ def api_get(path: str, params: dict[str, Any] | None = None) -> Any:
     raise RuntimeError("Upbit API retry exhausted")
 
 
-def fetch_termination_symbols() -> set[str]:
-    params = urlencode({"page": 1, "per_page": 100, "thread_name": "general"})
-    request = Request(
-        f"{NOTICE_API}?{params}",
-        headers={"User-Agent": "Mozilla/5.0 bes-momentum-scanner/2.0"},
-    )
-    try:
-        with urlopen(request, timeout=30) as response:
-            payload = json.load(response)
-    except (HTTPError, URLError, TimeoutError, ValueError, KeyError):
-        return set()
-    blocked: set[str] = set()
-    for notice in payload.get("data", {}).get("list", []):
-        title = str(notice.get("title", ""))
-        if "거래지원 종료" in title:
-            blocked.update(re.findall(r"\(([A-Z0-9]{2,12})\)", title.upper()))
-    return blocked
-
-
 def ticker_map(markets: list[str]) -> dict[str, dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for index in range(0, len(markets), 100):
@@ -74,13 +55,13 @@ def ticker_map(markets: list[str]) -> dict[str, dict[str, Any]]:
     return {str(row["market"]): row for row in rows}
 
 
-def completed_hourly_candles(market: str, count: int = 60) -> list[dict[str, Any]]:
-    rows = api_get("/candles/minutes/60", {"market": market, "count": count})
+def completed_15m_candles(market: str, count: int = 200) -> list[dict[str, Any]]:
+    rows = api_get("/candles/minutes/15", {"market": market, "count": count})
     now = datetime.now(timezone.utc)
     completed: list[dict[str, Any]] = []
     for row in rows:
         started = datetime.fromisoformat(row["candle_date_time_utc"]).replace(tzinfo=timezone.utc)
-        if started + timedelta(hours=1) <= now:
+        if started + timedelta(minutes=15) <= now:
             completed.append(row)
     completed.reverse()
     return completed
@@ -105,17 +86,19 @@ def percentile_ranks(rows: list[dict[str, Any]], field: str) -> dict[str, float]
 
 
 def scan_market(market: str, ticker: dict[str, Any]) -> dict[str, Any]:
-    candles = completed_hourly_candles(market)
-    if len(candles) < 30:
-        raise ValueError(f"hourly bars={len(candles)}")
+    candles = completed_15m_candles(market)
+    if len(candles) < 120:
+        raise ValueError(f"15m bars={len(candles)}")
     closes = [float(row["trade_price"]) for row in candles]
     last = candles[-1]
     close = closes[-1]
-    prior_high_20 = max(float(row["high_price"]) for row in candles[-21:-1])
-    hourly_values = [float(row.get("candle_acc_trade_price", 0.0)) for row in candles]
-    average_20 = sum(hourly_values[-21:-1]) / 20.0
-    value_ratio_1h = hourly_values[-1] / average_20 if average_20 > 0 else 0.0
-    value_ratio_4h = sum(hourly_values[-4:]) / (average_20 * 4.0) if average_20 > 0 else 0.0
+    prior_high_20 = max(float(row["high_price"]) for row in candles[-97:-1])
+    prior_low_20 = min(float(row["low_price"]) for row in candles[-97:-1])
+    values = [float(row.get("candle_acc_trade_price", 0.0)) for row in candles]
+    baseline = sorted(values[-97:-1])[48]
+    value_ratio_15m = values[-1] / baseline if baseline > 0 else 0.0
+    value_ratio_1h = sum(values[-4:]) / (baseline * 4.0) if baseline > 0 else 0.0
+    value_ratio_4h = sum(values[-16:]) / (baseline * 16.0) if baseline > 0 else 0.0
     open_price = float(last["opening_price"])
     high = float(last["high_price"])
     low = float(last["low_price"])
@@ -126,14 +109,17 @@ def scan_market(market: str, ticker: dict[str, Any]) -> dict[str, Any]:
         "current_price": float(ticker["trade_price"]),
         "trade_value_24h": float(ticker["acc_trade_price_24h"]),
         "change_24h": float(ticker["signed_change_rate"]) * 100.0,
-        "change_1h": pct_change(close, closes[-2]),
-        "change_4h": pct_change(close, closes[-5]),
-        "change_12h": pct_change(close, closes[-13]),
+        "change_15m": pct_change(close, closes[-2]),
+        "change_1h": pct_change(close, closes[-5]),
+        "change_4h": pct_change(close, closes[-17]),
+        "change_12h": pct_change(close, closes[-49]),
+        "value_ratio_15m": value_ratio_15m,
         "value_ratio_1h": value_ratio_1h,
         "value_ratio_4h": value_ratio_4h,
         "breakout_20h": close > prior_high_20,
         "distance_to_high_20h": ((prior_high_20 - close) / close) * 100.0,
-        "above_ema20": close > ema(closes[-30:], 20),
+        "compression_24h": pct_change(prior_high_20, prior_low_20),
+        "above_ema20": close > ema(closes[-80:], 80),
         "close_position": (close - low) / candle_range,
         "upper_wick_ratio": (high - max(open_price, close)) / candle_range,
         "signal_candle_time": last["candle_date_time_utc"] + "Z",
@@ -142,8 +128,10 @@ def scan_market(market: str, ticker: dict[str, Any]) -> dict[str, Any]:
 
 def stage_for(row: dict[str, Any]) -> str:
     change = float(row["change_12h"])
-    if row["change_1h"] > 5.0:
+    if change >= 12.0 or row["change_1h"] >= 8.0:
         return "강한 상승"
+    if change < 2.0:
+        return "준비 관찰"
     if change < 8.0:
         return "초기 포착"
     if change < 15.0:
@@ -160,7 +148,7 @@ def score_row(row: dict[str, Any], relative_strength: float) -> dict[str, Any]:
         + max(0.0, row["change_4h"] * 1.5)
         + max(0.0, row["change_12h"] * 0.5),
     )
-    flow_ratio = max(float(row["value_ratio_1h"]), float(row["value_ratio_4h"]))
+    flow_ratio = max(float(row["value_ratio_15m"]), float(row["value_ratio_1h"]))
     flow = min(25.0, max(0.0, 8.0 + (flow_ratio - 1.0) * 12.0))
     breakout = 20.0 if row["breakout_20h"] else max(0.0, 20.0 - max(0.0, row["distance_to_high_20h"]) * 6.0)
     strength = relative_strength * 15.0
@@ -184,17 +172,18 @@ def score_row(row: dict[str, Any], relative_strength: float) -> dict[str, Any]:
 
 
 def qualifies(row: dict[str, Any]) -> bool:
-    has_acceleration = row["change_1h"] >= 0.5 or row["change_4h"] >= 2.0 or row["change_12h"] >= 3.0
-    has_flow = row["value_ratio_1h"] >= 1.3 or row["value_ratio_4h"] >= 1.2
-    near_or_breaking = row["breakout_20h"] or row["distance_to_high_20h"] <= 2.5
+    has_acceleration = row["change_15m"] >= 0.35 or row["change_1h"] >= 1.2
+    has_flow = row["value_ratio_15m"] >= 1.7 or row["value_ratio_1h"] >= 1.5
+    near_or_breaking = row["breakout_20h"] or row["distance_to_high_20h"] <= 1.5
+    compressed_or_early = row["compression_24h"] <= 12.0 or row["change_12h"] <= 8.0
     return (
         row["trade_value_24h"] >= MIN_TRADE_VALUE_24H
         and row["above_ema20"]
         and has_acceleration
         and has_flow
         and near_or_breaking
-        and row["change_12h"] <= 35.0
-        and row["close_position"] >= 0.45
+        and compressed_or_early
+        and row["close_position"] >= 0.50
     )
 
 
@@ -207,31 +196,28 @@ def load_previous() -> dict[str, dict[str, Any]]:
 
 
 def main() -> None:
-    markets_raw = api_get("/market/all", {"is_details": "true"})
-    termination_symbols = fetch_termination_symbols()
+    markets_raw = api_get("/market/all", {"isDetails": "true"})
     risk_exclusions = [
         {
             "market": row["market"],
-            "reason": "UPBIT_WARNING" if row.get("market_event", {}).get("warning") is True else "TRADING_SUPPORT_TERMINATION_NOTICE",
+            "reason": "BITHUMB_CAUTION",
         }
         for row in markets_raw
         if row["market"].startswith("KRW-")
         and (
-            row.get("market_event", {}).get("warning") is True
-            or row["market"].split("-", 1)[1] in termination_symbols
+            str(row.get("market_warning", "NONE")).upper() != "NONE"
         )
     ]
     markets = sorted(
         row["market"] for row in markets_raw
         if row["market"].startswith("KRW-")
         and row["market"].split("-", 1)[1] not in STABLE_SYMBOLS
-        and row.get("market_event", {}).get("warning") is not True
-        and row["market"].split("-", 1)[1] not in termination_symbols
+        and str(row.get("market_warning", "NONE")).upper() == "NONE"
     )
     tickers = ticker_map(markets)
     scanned_rows: list[dict[str, Any]] = []
     exclusions: list[dict[str, Any]] = []
-    with ThreadPoolExecutor(max_workers=20) as executor:
+    with ThreadPoolExecutor(max_workers=5) as executor:
         futures = {
             executor.submit(scan_market, market, tickers[market]): market
             for market in markets
@@ -244,22 +230,34 @@ def main() -> None:
                 exclusions.append({"market": market, "reason": f"{type(exc).__name__}: {exc}"})
             print(f"[{index}/{len(markets)}] {market}", flush=True)
 
-    rank_4h = percentile_ranks(scanned_rows, "change_4h")
+    rank_4h = percentile_ranks(scanned_rows, "change_1h")
     rank_12h = percentile_ranks(scanned_rows, "change_12h")
     previous = load_previous()
     now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     candidates: list[dict[str, Any]] = []
     for row in scanned_rows:
-        if not qualifies(row):
+        prior = previous.get(row["market"], {})
+        first_detected = prior.get("first_detected_at")
+        try:
+            first_dt = datetime.fromisoformat(first_detected.replace("Z", "+00:00")) if first_detected else None
+        except ValueError:
+            first_dt = None
+        still_tracking = first_dt is not None and datetime.now(timezone.utc) - first_dt <= timedelta(hours=TRACK_HOURS)
+        if not qualifies(row) and not still_tracking:
             continue
         strength = (rank_4h[row["market"]] + rank_12h[row["market"]]) / 2.0
         candidate = score_row(row, strength)
         if candidate["score"] < 60:
             continue
-        prior = previous.get(row["market"], {})
         candidate["first_detected_at"] = prior.get("first_detected_at", now_iso)
         candidate["first_detected_price"] = prior.get("first_detected_price", row["current_price"])
-        candidate["action"] = "매수 검토" if candidate["stage"] in {"초기 포착", "돌파 진행"} and candidate["change_1h"] <= 5.0 else "눌림 대기"
+        first_price = max(float(candidate["first_detected_price"]), 1e-12)
+        current_return = pct_change(candidate["current_price"], first_price)
+        candidate["return_since_detection"] = current_return
+        candidate["peak_return_since_detection"] = max(float(prior.get("peak_return_since_detection", current_return)), current_return)
+        candidate["mae_since_detection"] = min(float(prior.get("mae_since_detection", current_return)), current_return)
+        early_trigger = qualifies(row) and 1.5 <= candidate["change_12h"] <= 10.0 and candidate["change_1h"] <= 6.0
+        candidate["action"] = "매수 검토" if early_trigger else "눌림 대기"
         candidates.append(candidate)
 
     candidates.sort(
@@ -273,9 +271,10 @@ def main() -> None:
     candidates = candidates[:MAX_RESULTS]
     actionable_count = sum(row["action"] == "매수 검토" for row in candidates)
     result = {
-        "engine": "BES Momentum V1",
+        "engine": "BES Momentum 15m V2",
+        "scan_interval_minutes": 15,
         "updated_at": now_iso,
-        "source": "Upbit official public REST API",
+        "source": "Bithumb official public REST API",
         "market_count": len(markets),
         "scanned_count": len(scanned_rows),
         "excluded_count": len(exclusions),
