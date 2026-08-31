@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bithumb KRW 15-minute compression-breakout scanner.
+"""Bithumb KRW 15-minute dual-route momentum scanner.
 
 The former ABC-only scanner is preserved in bes_core.py for comparison.
 This production scanner ranks early price acceleration, trading-value expansion,
@@ -183,7 +183,7 @@ def score_row(row: dict[str, Any], relative_strength: float) -> dict[str, Any]:
     }
 
 
-def qualifies(row: dict[str, Any]) -> bool:
+def classic_qualifies(row: dict[str, Any]) -> bool:
     has_acceleration = row["change_15m"] >= 0.35 or row["change_1h"] >= 1.2
     has_flow = row["value_ratio_15m"] >= 1.7 or row["value_ratio_1h"] >= 1.5
     near_or_breaking = row["breakout_20h"] or row["distance_to_high_20h"] <= 1.5
@@ -197,6 +197,63 @@ def qualifies(row: dict[str, Any]) -> bool:
         and compressed_or_early
         and row["close_position"] >= 0.50
     )
+
+
+def surge_qualifies(row: dict[str, Any], score: int) -> bool:
+    """Catch fresh volume-led moves that are no longer tightly compressed."""
+    has_acceleration = (
+        row["change_15m"] >= 0.50
+        or row["change_1h"] >= 1.80
+        or row["change_4h"] >= 4.00
+    )
+    has_flow = (
+        row["value_ratio_15m"] >= 1.40
+        or row["value_ratio_1h"] >= 1.40
+        or row["value_ratio_4h"] >= 1.80
+    )
+    return (
+        row["trade_value_24h"] >= MIN_TRADE_VALUE_24H
+        and row["above_ema20"]
+        and score >= 75
+        and row["change_12h"] < SUCCESS_RETURN
+        and has_acceleration
+        and has_flow
+        and row["close_position"] >= 0.45
+        and row["upper_wick_ratio"] <= 0.60
+    )
+
+
+def detection_route(row: dict[str, Any], score: int) -> str | None:
+    # A coin already above the success threshold is shown as a late surge, not
+    # opened as a new recommendation or counted in performance.
+    if row["change_12h"] >= SUCCESS_RETURN:
+        return None
+    if classic_qualifies(row) and score >= 60:
+        return "압축 초입형"
+    if surge_qualifies(row, score):
+        return "거래량 급증형"
+    return None
+
+
+def exclusion_reasons(row: dict[str, Any], score: int) -> list[str]:
+    reasons: list[str] = []
+    if row["change_12h"] >= SUCCESS_RETURN:
+        reasons.append("이미 12시간 +10% 이상 급등")
+    if row["trade_value_24h"] < MIN_TRADE_VALUE_24H:
+        reasons.append("24시간 거래대금 부족")
+    if not row["above_ema20"]:
+        reasons.append("20시간 추세선 아래")
+    if not (row["change_15m"] >= 0.35 or row["change_1h"] >= 1.2 or row["change_4h"] >= 4.0):
+        reasons.append("가격 가속 부족")
+    if not (row["value_ratio_15m"] >= 1.4 or row["value_ratio_1h"] >= 1.4 or row["value_ratio_4h"] >= 1.8):
+        reasons.append("거래량 증가 부족")
+    if row["close_position"] < 0.45:
+        reasons.append("봉 종가 위치 약함")
+    if row["upper_wick_ratio"] > 0.60:
+        reasons.append("긴 윗꼬리")
+    if score < 60:
+        reasons.append("점수 60 미만")
+    return reasons or ["세부 조합 조건 미충족"]
 
 
 def load_previous() -> dict[str, Any]:
@@ -306,13 +363,15 @@ def main() -> None:
     now = datetime.now(timezone.utc)
     now_iso = now.isoformat().replace("+00:00", "Z")
     scored_rows: dict[str, dict[str, Any]] = {}
-    qualified_markets: set[str] = set()
+    qualified_routes: dict[str, str] = {}
     for row in scanned_rows:
         strength = (rank_4h[row["market"]] + rank_12h[row["market"]]) / 2.0
         scored = score_row(row, strength)
         scored_rows[row["market"]] = scored
-        if qualifies(row) and scored["score"] >= 60:
-            qualified_markets.add(row["market"])
+        route = detection_route(row, int(scored["score"]))
+        if route is not None:
+            qualified_routes[row["market"]] = route
+    qualified_markets = set(qualified_routes)
 
     tracking: list[dict[str, Any]] = []
     completed_now: list[dict[str, Any]] = []
@@ -330,11 +389,23 @@ def main() -> None:
         mae = min(float(prior.get("mae_since_detection", current_return)), observed_mae)
         elapsed_hours = max(0.0, (now - first_dt).total_seconds() / 3600.0)
 
+        first_change = float(prior.get("first_detected_change_12h", prior.get("change_12h", 0.0)))
+        if market not in qualified_markets:
+            current_action = "성과 추적"
+        elif current_return >= SUCCESS_RETURN or float(row["change_12h"]) >= SUCCESS_RETURN:
+            current_action = "추격 금지"
+        elif float(row["change_12h"]) >= 6.0:
+            current_action = "눌림 대기"
+        elif 1.5 <= float(row["change_12h"]) and float(row["change_1h"]) <= 6.0:
+            current_action = "매수 검토"
+        else:
+            current_action = "관찰"
+
         episode = {
             **public_row(row),
             "first_detected_at": prior.get("first_detected_at"),
             "first_detected_price": first_price,
-            "first_detected_change_12h": float(prior.get("first_detected_change_12h", prior.get("change_12h", 0.0))),
+            "first_detected_change_12h": first_change,
             "return_since_detection": round(current_return, 4),
             "peak_return_since_detection": round(peak, 4),
             "mae_since_detection": round(mae, 4),
@@ -342,10 +413,10 @@ def main() -> None:
             "status": "진행 중",
             "entry_quality": prior.get(
                 "entry_quality",
-                "정상 후보" if float(prior.get("first_detected_change_12h", prior.get("change_12h", 0.0))) < 6.0
-                else ("추격주의" if float(prior.get("first_detected_change_12h", prior.get("change_12h", 0.0))) < 10.0 else "추천 제외"),
+                "정상 후보" if first_change < 6.0 else ("추격주의" if first_change < 10.0 else "추천 제외"),
             ),
-            "action": prior.get("action", "눌림 대기"),
+            "action": current_action,
+            "detection_route": prior.get("detection_route", qualified_routes.get(market, "V3 이관")),
         }
 
         if failure_at and (not success_at or failure_at == success_at):
@@ -366,6 +437,25 @@ def main() -> None:
             completed_keys.add((episode["market"], episode["first_detected_at"]))
 
     completed.extend(completed_now)
+
+    # Completed outcomes stay fixed, but their current price/return remains live.
+    refreshed_completed: list[dict[str, Any]] = []
+    for prior in completed:
+        row = scored_rows.get(str(prior.get("market")))
+        if row is None:
+            refreshed_completed.append(prior)
+            continue
+        first_price = max(float(prior.get("first_detected_price", row["current_price"])), 1e-12)
+        item = {**prior, **public_row(row)}
+        item["return_at_completion"] = prior.get(
+            "return_at_completion", prior.get("return_since_detection")
+        )
+        item["return_since_detection"] = round(
+            pct_change(float(row["current_price"]), first_price), 4
+        )
+        item["action"] = "성과 완료"
+        refreshed_completed.append(item)
+    completed = refreshed_completed
 
     # Start a new episode only when the market is not already being tracked and
     # was not completed during this run. Already-risen coins are tracked for
@@ -402,6 +492,7 @@ def main() -> None:
             "status": "진행 중",
             "entry_quality": "정상 후보" if chase_risk < 6.0 else ("추격주의" if chase_risk < 10.0 else "추천 제외"),
             "action": "매수 검토" if 1.5 <= chase_risk < 6.0 and float(row["change_1h"]) <= 6.0 else "눌림 대기",
+            "detection_route": qualified_routes[market],
         }
         tracking.append(episode)
         new_signals.append(episode)
@@ -437,17 +528,39 @@ def main() -> None:
             "current_price": row["current_price"],
             "change_12h": row["change_12h"],
             "score": row["score"],
-            "reason": "12시간 상승 상위지만 포착 기록 없음",
+            "reason": "; ".join(exclusion_reasons(row, int(row["score"]))),
         }
         for row in leaders
         if row["market"] not in detected_markets
     ]
+    late_surges = [
+        {
+            **public_row(row),
+            "action": "이미 급등·추격 금지",
+            "reason": "12시간 +10% 이상 상승 후 확인",
+        }
+        for row in scored_rows.values()
+        if int(row["score"]) >= 70 and float(row["change_12h"]) >= SUCCESS_RETURN
+    ]
+    late_surges.sort(key=lambda row: (-float(row["change_12h"]), -int(row["score"])))
+    high_score_blocked = [
+        {
+            **public_row(row),
+            "action": "관찰",
+            "blocked_reasons": exclusion_reasons(row, int(row["score"])),
+        }
+        for row in scored_rows.values()
+        if int(row["score"]) >= 75
+        and row["market"] not in qualified_markets
+        and float(row["change_12h"]) < SUCCESS_RETURN
+    ]
+    high_score_blocked.sort(key=lambda row: (-int(row["score"]), -float(row["change_12h"])))
     completed = completed[-COMPLETED_HISTORY_LIMIT:]
     success_count = sum(row.get("status") == "성공" for row in completed)
     failure_count = sum(row.get("status") == "실패" for row in completed)
     win_rate = round(success_count / (success_count + failure_count) * 100.0, 2) if success_count + failure_count else None
     result = {
-        "engine": "BES Momentum 15m V3 Tracking",
+        "engine": "BES Momentum 15m V4 Dual Route",
         "scan_interval_minutes": 15,
         "updated_at": now_iso,
         "source": "Bithumb official public REST API",
@@ -472,6 +585,8 @@ def main() -> None:
         "completed": completed,
         "bithumb_12h_leaders": leaders,
         "missed_leaders": missed_leaders,
+        "late_surges": late_surges[:20],
+        "high_score_blocked": high_score_blocked[:20],
         "risk_exclusions": risk_exclusions,
         "exclusions": exclusions,
     }
