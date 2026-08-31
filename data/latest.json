@@ -1,7 +1,7 @@
 {
   "engine": "BES Momentum 15m V2",
   "scan_interval_minutes": 15,
-  "updated_at": "2026-08-31T01:39:08.915951Z",
+  "updated_at": "2026-08-31T01:41:28.381688Z",
   "source": "Bithumb official public REST API",
   "market_count": 458,
   "scanned_count": 458,
