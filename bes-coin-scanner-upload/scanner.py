@@ -32,7 +32,7 @@ FAILURE_RETURN = -5.0
 COMPLETED_HISTORY_LIMIT = 1000
 WATCH_HOURS = 12
 MIN_WATCH_HOURS = 6
-MAX_WATCHLIST = 50
+MAX_WATCHLIST = 500
 PAPER_START_CASH = 1_000_000.0
 PAPER_POSITION_KRW = 200_000.0
 PAPER_MAX_POSITIONS = 3
@@ -40,12 +40,14 @@ PAPER_FEE_RATE = 0.0004
 PAPER_SLIPPAGE_RATE = 0.001
 PAPER_HISTORY_LIMIT = 500
 PAPER_PENDING_MINUTES = 45
+MIN_ROTATION_PRICE = 0.01
 
 PAPER_STRATEGIES = {
     "A_EARLY": "A 초입형",
     "B_BREAKOUT": "B 돌파형",
     "C_PULLBACK": "C 눌림형",
     "D_CHAMPION": "D 현행형",
+    "E_ROTATION": "E 자금순환형",
 }
 
 
@@ -346,6 +348,37 @@ def ignition_score(row: dict[str, Any]) -> int:
     return round(max(0.0, min(100.0, score)))
 
 
+def rotation_score(row: dict[str, Any]) -> int:
+    """Detect fresh capital rotation without requiring a prior compression setup."""
+    if float(row["current_price"]) < MIN_ROTATION_PRICE or is_pump_late(row):
+        return 0
+    score = 0.0
+    ratio_15m = float(row["value_ratio_15m"])
+    ratio_1h = float(row["value_ratio_1h"])
+    flow_percentile = float(row.get("flow_percentile_15m", 0.0))
+    if flow_percentile >= 90.0:
+        score += 15.0
+    elif flow_percentile >= 80.0:
+        score += 8.0
+    if ratio_15m >= 2.0:
+        score += min(35.0, 20.0 + (ratio_15m - 2.0) * 7.5)
+    if ratio_1h >= 1.35:
+        score += min(20.0, 10.0 + (ratio_1h - 1.35) * 10.0)
+    if 0.20 <= float(row["change_15m"]) <= 2.50:
+        score += 15.0
+    if -0.50 <= float(row["change_1h"]) < 5.0:
+        score += 10.0
+    if float(row["close_position"]) >= 0.65:
+        score += 10.0
+    if float(row["upper_wick_ratio"]) <= 0.45:
+        score += 5.0
+    if row["obv_improving_4h"]:
+        score += 5.0
+    if not row["above_ema20"] and not row["obv_improving_4h"]:
+        score -= 20.0
+    return round(max(0.0, min(100.0, score)))
+
+
 def is_pump_late(row: dict[str, Any]) -> bool:
     return (
         float(row["change_1h"]) >= 8.0
@@ -358,9 +391,15 @@ def is_pump_late(row: dict[str, Any]) -> bool:
     )
 
 
-def watch_stage(row: dict[str, Any], prep: int, ignition: int) -> tuple[str, str]:
+def watch_stage(
+    row: dict[str, Any], prep: int, ignition: int, rotation: int, rotation_streak: int
+) -> tuple[str, str]:
     if is_pump_late(row):
         return "펌핑 후기", "추격 금지"
+    if rotation >= 70 and rotation_streak >= 2 and float(row["change_1h"]) < 6.0:
+        return "매수 검토", "자금유입 2회 확인"
+    if rotation >= 65:
+        return "자금 유입", "초입 관찰"
     if (
         row["breakout_20h"]
         and ignition >= 65
@@ -401,20 +440,26 @@ def update_watch_state(
     for market, row in scored_rows.items():
         prep = preparation_score(row)
         ignition = ignition_score(row)
+        rotation = rotation_score(row)
         prior = previous.get(market)
+        rotation_streak = (
+            int(prior.get("rotation_streak", 0)) + 1
+            if prior is not None and rotation >= 65
+            else (1 if rotation >= 65 else 0)
+        )
         first_dt = parse_utc(prior.get("first_watch_at")) if prior else None
         age = max(0.0, (now - first_dt).total_seconds() / 3600.0) if first_dt else 0.0
         should_start = (
-            prep >= 55
+            (prep >= 55 or rotation >= 55)
             and float(row["trade_value_24h"]) >= MIN_TRADE_VALUE_24H
             and not is_pump_late(row)
         )
         should_keep = prior is not None and age < WATCH_HOURS and (
-            age < MIN_WATCH_HOURS or prep >= 35 or ignition >= 35
+            age < MIN_WATCH_HOURS or prep >= 35 or ignition >= 35 or rotation >= 35
         )
         if not should_start and not should_keep:
             continue
-        stage, action = watch_stage(row, prep, ignition)
+        stage, action = watch_stage(row, prep, ignition, rotation, rotation_streak)
         first_price = float(prior.get("first_watch_price", row["current_price"])) if prior else float(row["current_price"])
         current_return = pct_change(float(row["current_price"]), first_price)
         item = {
@@ -427,6 +472,8 @@ def update_watch_state(
             "watch_age_hours": round(age, 2),
             "preparation_score": prep,
             "ignition_score": ignition,
+            "rotation_score": rotation,
+            "rotation_streak": rotation_streak,
             "watch_stage": stage,
             "action": action,
             "return_since_watch": round(current_return, 4),
@@ -440,7 +487,7 @@ def update_watch_state(
         watchlist.append(item)
     watchlist.sort(
         key=lambda row: (
-            {"매수 검토": 0, "돌파 임박": 1, "점화": 2, "준비": 3, "펌핑 후기": 4}.get(str(row["watch_stage"]), 5),
+            {"매수 검토": 0, "돌파 임박": 1, "자금 유입": 2, "점화": 3, "준비": 4, "펌핑 후기": 5}.get(str(row["watch_stage"]), 6),
             -int(row["ignition_score"]),
             -int(row["preparation_score"]),
         )
@@ -525,18 +572,18 @@ def update_signal_memory(
     for market, row in scored_rows.items():
         prep = preparation_score(row)
         ignition = ignition_score(row)
+        rotation = rotation_score(row)
         prior = prior_map.get(market, {}) if isinstance(prior_map.get(market, {}), dict) else {}
-        last_dt = parse_utc(prior.get("last_observed_at"))
-        fresh = last_dt is not None and now - last_dt < timedelta(hours=TRACK_HOURS)
         early = float(row["change_1h"]) < 5.0 and float(row["change_12h"]) < 8.0
-        if not (prep >= 40 or ignition >= 30 or fresh):
-            continue
         first_prep = prior.get("first_preparation_at")
         first_ignition = prior.get("first_ignition_at")
+        first_rotation = prior.get("first_rotation_at")
         if early and prep >= 55 and not first_prep:
             first_prep = now_iso
         if early and ignition >= 45 and not first_ignition:
             first_ignition = now_iso
+        if early and rotation >= 65 and not first_rotation:
+            first_rotation = now_iso
         memory[market] = {
             "market": market,
             "symbol": row["symbol"],
@@ -544,13 +591,69 @@ def update_signal_memory(
             "last_observed_at": now_iso,
             "first_preparation_at": first_prep,
             "first_ignition_at": first_ignition,
+            "first_rotation_at": first_rotation,
             "first_observed_price": prior.get("first_observed_price", row["current_price"]),
             "max_preparation_score": max(int(prior.get("max_preparation_score", 0)), prep),
             "max_ignition_score": max(int(prior.get("max_ignition_score", 0)), ignition),
+            "max_rotation_score": max(int(prior.get("max_rotation_score", 0)), rotation),
             "earliest_change_12h": prior.get("earliest_change_12h", row["change_12h"]),
             "current_change_12h": row["change_12h"],
+            "current_change_1h": row["change_1h"],
+            "current_value_ratio_15m": round(float(row["value_ratio_15m"]), 4),
+            "current_value_ratio_1h": round(float(row["value_ratio_1h"]), 4),
+            "previous_change_1h": prior.get("current_change_1h"),
+            "previous_value_ratio_15m": prior.get("current_value_ratio_15m"),
         }
     return memory
+
+
+def build_market_monitor(
+    scored_rows: dict[str, dict[str, Any]], signal_memory: dict[str, dict[str, Any]]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Keep every normal market observable and surface fresh flow independently."""
+    monitor: list[dict[str, Any]] = []
+    for market, row in scored_rows.items():
+        rotation = rotation_score(row)
+        memory = signal_memory.get(market, {})
+        if is_pump_late(row):
+            state = "급등 후기"
+        elif rotation >= 70:
+            state = "강한 자금 유입"
+        elif rotation >= 55:
+            state = "자금 유입 감시"
+        elif rotation >= 40:
+            state = "유입 준비"
+        else:
+            state = "일반 감시"
+        monitor.append({
+            "market": market,
+            "symbol": row["symbol"],
+            "current_price": row["current_price"],
+            "monitor_state": state,
+            "rotation_score": rotation,
+            "flow_percentile_15m": row.get("flow_percentile_15m"),
+            "flow_percentile_1h": row.get("flow_percentile_1h"),
+            "value_ratio_15m": round(float(row["value_ratio_15m"]), 4),
+            "value_ratio_1h": round(float(row["value_ratio_1h"]), 4),
+            "change_15m": row["change_15m"],
+            "change_1h": row["change_1h"],
+            "change_12h": row["change_12h"],
+            "close_position": row["close_position"],
+            "upper_wick_ratio": row["upper_wick_ratio"],
+            "first_rotation_at": memory.get("first_rotation_at"),
+        })
+    monitor.sort(
+        key=lambda row: (
+            -int(row["rotation_score"]),
+            -float(row.get("flow_percentile_15m") or 0.0),
+            -float(row["value_ratio_15m"]),
+        )
+    )
+    rotation_watch = [
+        row for row in monitor
+        if int(row["rotation_score"]) >= 40 and row["monitor_state"] != "급등 후기"
+    ][:30]
+    return monitor, rotation_watch
 
 
 def strategy_signal(
@@ -583,6 +686,14 @@ def strategy_signal(
         return ok, "고점 아래 첫 눌림"
     if strategy == "D_CHAMPION":
         return detection_route(row, int(row["score"])) is not None, "V4 현행 조건"
+    if strategy == "E_ROTATION":
+        ok = bool(
+            watch
+            and watch.get("action") == "자금유입 2회 확인"
+            and int(watch.get("rotation_score", 0)) >= 70
+            and int(watch.get("rotation_streak", 0)) >= 2
+        )
+        return ok, "자금유입 2회 확인"
     return False, "알 수 없는 전략"
 
 
@@ -745,6 +856,8 @@ def update_paper_league(
                     priority = float(watch.get("preparation_score", 0)) + float(watch.get("ignition_score", 0))
                 elif strategy in {"B_BREAKOUT", "C_PULLBACK"}:
                     priority = float(watch.get("ignition_score", 0))
+                elif strategy == "E_ROTATION":
+                    priority = float(watch.get("rotation_score", 0))
                 else:
                     priority = float(row.get("score", 0))
                 signal_candidates.append((priority, market, row, reason))
@@ -882,6 +995,8 @@ def main() -> None:
 
     rank_4h = percentile_ranks(scanned_rows, "change_1h")
     rank_12h = percentile_ranks(scanned_rows, "change_12h")
+    rank_flow_15m = percentile_ranks(scanned_rows, "value_ratio_15m")
+    rank_flow_1h = percentile_ranks(scanned_rows, "value_ratio_1h")
     state = load_previous()
     previous_tracking: dict[str, dict[str, Any]] = state["tracking"]
     completed: list[dict[str, Any]] = state["completed"]
@@ -893,17 +1008,20 @@ def main() -> None:
     scored_rows: dict[str, dict[str, Any]] = {}
     qualified_routes: dict[str, str] = {}
     for row in scanned_rows:
+        row["flow_percentile_15m"] = round(rank_flow_15m[row["market"]] * 100.0, 1)
+        row["flow_percentile_1h"] = round(rank_flow_1h[row["market"]] * 100.0, 1)
         strength = (rank_4h[row["market"]] + rank_12h[row["market"]]) / 2.0
         scored = score_row(row, strength)
         scored_rows[row["market"]] = scored
     watchlist = update_watch_state(scored_rows, now, now_iso)
     watch_by_market = {row["market"]: row for row in watchlist}
     signal_memory = update_signal_memory(state.get("signal_memory"), scored_rows, now, now_iso)
+    market_monitor, rotation_watch = build_market_monitor(scored_rows, signal_memory)
     paper_league = update_paper_league(
         state.get("paper_league"), scored_rows, watchlist, now, now_iso
     )
     for item in watchlist:
-        if item["watch_stage"] in {"점화", "돌파 임박", "매수 검토"}:
+        if item["watch_stage"] in {"점화", "자금 유입", "돌파 임박", "매수 검토"}:
             qualified_routes[item["market"]] = str(item["watch_stage"])
     qualified_markets = set(qualified_routes)
 
@@ -1031,7 +1149,7 @@ def main() -> None:
             "entry_quality": "정상 후보" if chase_risk < 6.0 else ("추격주의" if chase_risk < 10.0 else "추천 제외"),
             "action": str(watch_by_market[market]["action"]),
             "detection_route": qualified_routes[market],
-            "engine_version": "V5",
+            "engine_version": "V5.1",
             "first_watch_at": watch_by_market[market]["first_watch_at"],
             "first_watch_price": watch_by_market[market]["first_watch_price"],
         }
@@ -1044,6 +1162,7 @@ def main() -> None:
     candidates.sort(
         key=lambda row: (
             row["action"] != "매수 검토",
+            -row.get("rotation_score", 0),
             -row["ignition_score"],
             -row["preparation_score"],
             -row["relative_strength_percentile"],
@@ -1103,7 +1222,7 @@ def main() -> None:
     v5_ongoing = sum(row.get("engine_version") == "V5" for row in tracking)
     v5_win_rate = round(v5_success / (v5_success + v5_failure) * 100.0, 2) if v5_success + v5_failure else None
     result = {
-        "engine": "BES Momentum 15m V5 Persistent Watch",
+        "engine": "BES Momentum 15m V5.1 Rotation Challenger",
         "scan_interval_minutes": 15,
         "updated_at": now_iso,
         "source": "Bithumb official public REST API",
@@ -1129,8 +1248,12 @@ def main() -> None:
             "rule": "+10% within 12h = success; -5% first or no +10% within 12h = failure",
         },
         "risk_excluded_count": len(risk_exclusions),
+        "monitor_count": len(market_monitor),
+        "rotation_watch_count": len(rotation_watch),
         "candidates": candidates,
         "watchlist": watchlist,
+        "rotation_watch": rotation_watch,
+        "market_monitor": market_monitor,
         "signal_memory": signal_memory,
         "paper_league": paper_league,
         "new_signals": new_signals,
