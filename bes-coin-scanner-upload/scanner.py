@@ -22,6 +22,7 @@ from urllib.request import Request, urlopen
 
 API = "https://api.bithumb.com/v1"
 OUT = Path("data/latest.json")
+WATCH_STATE = Path("data/watch_state.json")
 STABLE_SYMBOLS = {"USDT", "USDC", "DAI", "TUSD", "FDUSD", "USDE", "PYUSD"}
 MIN_TRADE_VALUE_24H = 500_000_000
 MAX_RESULTS = 20
@@ -29,6 +30,9 @@ TRACK_HOURS = 12
 SUCCESS_RETURN = 10.0
 FAILURE_RETURN = -5.0
 COMPLETED_HISTORY_LIMIT = 1000
+WATCH_HOURS = 12
+MIN_WATCH_HOURS = 6
+MAX_WATCHLIST = 50
 
 
 def api_get(path: str, params: dict[str, Any] | None = None) -> Any:
@@ -106,6 +110,24 @@ def scan_market(market: str, ticker: dict[str, Any]) -> dict[str, Any]:
     high = float(last["high_price"])
     low = float(last["low_price"])
     candle_range = max(high - low, close * 1e-9)
+    lows = [float(row["low_price"]) for row in candles]
+    highs = [float(row["high_price"]) for row in candles]
+    hourly_lows = [min(lows[index:index + 4]) for index in range(len(lows) - 12, len(lows), 4)]
+    higher_low_count = sum(
+        hourly_lows[index] > hourly_lows[index - 1]
+        for index in range(1, len(hourly_lows))
+    )
+    obv = 0.0
+    obv_series: list[float] = []
+    for index in range(1, len(candles)):
+        if closes[index] > closes[index - 1]:
+            obv += values[index]
+        elif closes[index] < closes[index - 1]:
+            obv -= values[index]
+        obv_series.append(obv)
+    obv_improving = len(obv_series) >= 17 and obv_series[-1] > obv_series[-17]
+    prior_high_4h = max(highs[-17:-1])
+    ema_20h = ema(closes[-80:], 80)
     return {
         "market": market,
         "symbol": market.removeprefix("KRW-"),
@@ -121,8 +143,13 @@ def scan_market(market: str, ticker: dict[str, Any]) -> dict[str, Any]:
         "value_ratio_4h": value_ratio_4h,
         "breakout_20h": close > prior_high_20,
         "distance_to_high_20h": ((prior_high_20 - close) / close) * 100.0,
+        "distance_to_high_4h": ((prior_high_4h - close) / close) * 100.0,
+        "drawdown_from_high_4h": pct_change(close, prior_high_4h),
         "compression_24h": pct_change(prior_high_20, prior_low_20),
-        "above_ema20": close > ema(closes[-80:], 80),
+        "above_ema20": close > ema_20h,
+        "distance_from_ema20": pct_change(close, ema_20h),
+        "higher_low_count": higher_low_count,
+        "obv_improving_4h": obv_improving,
         "close_position": (close - low) / candle_range,
         "upper_wick_ratio": (high - max(open_price, close)) / candle_range,
         "signal_candle_time": last["candle_date_time_utc"] + "Z",
@@ -256,6 +283,157 @@ def exclusion_reasons(row: dict[str, Any], score: int) -> list[str]:
     return reasons or ["세부 조합 조건 미충족"]
 
 
+def preparation_score(row: dict[str, Any]) -> int:
+    """Score conditions that normally appear before acceleration."""
+    score = 0.0
+    if row["trade_value_24h"] >= MIN_TRADE_VALUE_24H:
+        score += 15.0
+    score += max(0.0, 20.0 - max(0.0, float(row["compression_24h"]) - 4.0) * 2.5)
+    if -2.0 <= float(row["change_1h"]) <= 3.0:
+        score += 15.0
+    if -3.0 <= float(row["change_4h"]) <= 5.0:
+        score += 10.0
+    score += min(15.0, float(row["higher_low_count"]) * 7.5)
+    if row["obv_improving_4h"]:
+        score += 15.0
+    if row["above_ema20"]:
+        score += 10.0
+    score += min(15.0, float(row["relative_strength_percentile"]) * 0.15)
+    if float(row["change_1h"]) >= 5.0 or float(row["change_12h"]) >= 8.0:
+        score -= 25.0
+    if float(row["distance_from_ema20"]) >= 7.0:
+        score -= 20.0
+    return round(max(0.0, min(100.0, score)))
+
+
+def ignition_score(row: dict[str, Any]) -> int:
+    """Score the first capital-flow expansion, before a full pump."""
+    score = 0.0
+    flow = max(
+        float(row["value_ratio_15m"]),
+        float(row["value_ratio_1h"]),
+        float(row["value_ratio_4h"]),
+    )
+    score += min(30.0, max(0.0, (flow - 1.0) * 20.0))
+    if 0.20 <= float(row["change_15m"]) <= 2.50:
+        score += 20.0
+    if -1.0 <= float(row["change_1h"]) < 5.0:
+        score += 10.0
+    if float(row["close_position"]) >= 0.65:
+        score += 15.0
+    if float(row["distance_to_high_4h"]) <= 3.0:
+        score += 10.0
+    if row["obv_improving_4h"]:
+        score += 10.0
+    if row["above_ema20"]:
+        score += 5.0
+    if float(row["upper_wick_ratio"]) > 0.55:
+        score -= 25.0
+    return round(max(0.0, min(100.0, score)))
+
+
+def is_pump_late(row: dict[str, Any]) -> bool:
+    return (
+        float(row["change_1h"]) >= 8.0
+        or float(row["change_12h"]) >= 12.0
+        or float(row["distance_from_ema20"]) >= 10.0
+        or (
+            float(row["drawdown_from_high_4h"]) <= -8.0
+            and float(row["change_4h"]) >= 5.0
+        )
+    )
+
+
+def watch_stage(row: dict[str, Any], prep: int, ignition: int) -> tuple[str, str]:
+    if is_pump_late(row):
+        return "펌핑 후기", "추격 금지"
+    if (
+        row["breakout_20h"]
+        and ignition >= 65
+        and float(row["close_position"]) >= 0.65
+    ):
+        return "매수 검토", "매수 검토"
+    if ignition >= 60 and float(row["distance_to_high_4h"]) <= 2.0:
+        return "돌파 임박", "돌파 대기"
+    if ignition >= 45:
+        return "점화", "점화 확인"
+    return "준비", "급등 준비"
+
+
+def load_watch_state() -> dict[str, dict[str, Any]]:
+    try:
+        payload = json.loads(WATCH_STATE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        # GitHub Actions already commits latest.json. This fallback keeps V5
+        # state persistent even before the workflow is upgraded to commit the
+        # dedicated state file as well.
+        try:
+            payload = json.loads(OUT.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+    rows = payload.get("watchlist", []) if isinstance(payload, dict) else []
+    return {
+        str(row["market"]): row
+        for row in rows
+        if isinstance(row, dict) and row.get("market")
+    }
+
+
+def update_watch_state(
+    scored_rows: dict[str, dict[str, Any]], now: datetime, now_iso: str
+) -> list[dict[str, Any]]:
+    previous = load_watch_state()
+    watchlist: list[dict[str, Any]] = []
+    for market, row in scored_rows.items():
+        prep = preparation_score(row)
+        ignition = ignition_score(row)
+        prior = previous.get(market)
+        first_dt = parse_utc(prior.get("first_watch_at")) if prior else None
+        age = max(0.0, (now - first_dt).total_seconds() / 3600.0) if first_dt else 0.0
+        should_start = (
+            prep >= 55
+            and float(row["trade_value_24h"]) >= MIN_TRADE_VALUE_24H
+            and not is_pump_late(row)
+        )
+        should_keep = prior is not None and age < WATCH_HOURS and (
+            age < MIN_WATCH_HOURS or prep >= 35 or ignition >= 35
+        )
+        if not should_start and not should_keep:
+            continue
+        stage, action = watch_stage(row, prep, ignition)
+        first_price = float(prior.get("first_watch_price", row["current_price"])) if prior else float(row["current_price"])
+        current_return = pct_change(float(row["current_price"]), first_price)
+        item = {
+            **public_row(row),
+            "engine_version": "V5",
+            "first_watch_at": prior.get("first_watch_at", now_iso) if prior else now_iso,
+            "first_watch_price": first_price,
+            "first_detected_at": prior.get("first_watch_at", now_iso) if prior else now_iso,
+            "first_detected_price": first_price,
+            "watch_age_hours": round(age, 2),
+            "preparation_score": prep,
+            "ignition_score": ignition,
+            "watch_stage": stage,
+            "action": action,
+            "return_since_watch": round(current_return, 4),
+            "peak_return_since_watch": round(max(float(prior.get("peak_return_since_watch", current_return)) if prior else current_return, current_return), 4),
+            "mae_since_watch": round(min(float(prior.get("mae_since_watch", current_return)) if prior else current_return, current_return), 4),
+            "state_changed_at": (
+                now_iso if not prior or prior.get("watch_stage") != stage
+                else prior.get("state_changed_at", now_iso)
+            ),
+        }
+        watchlist.append(item)
+    watchlist.sort(
+        key=lambda row: (
+            {"매수 검토": 0, "돌파 임박": 1, "점화": 2, "준비": 3, "펌핑 후기": 4}.get(str(row["watch_stage"]), 5),
+            -int(row["ignition_score"]),
+            -int(row["preparation_score"]),
+        )
+    )
+    return watchlist[:MAX_WATCHLIST]
+
+
 def load_previous() -> dict[str, Any]:
     try:
         payload = json.loads(OUT.read_text(encoding="utf-8"))
@@ -368,9 +546,11 @@ def main() -> None:
         strength = (rank_4h[row["market"]] + rank_12h[row["market"]]) / 2.0
         scored = score_row(row, strength)
         scored_rows[row["market"]] = scored
-        route = detection_route(row, int(scored["score"]))
-        if route is not None:
-            qualified_routes[row["market"]] = route
+    watchlist = update_watch_state(scored_rows, now, now_iso)
+    watch_by_market = {row["market"]: row for row in watchlist}
+    for item in watchlist:
+        if item["watch_stage"] in {"점화", "돌파 임박", "매수 검토"}:
+            qualified_routes[item["market"]] = str(item["watch_stage"])
     qualified_markets = set(qualified_routes)
 
     tracking: list[dict[str, Any]] = []
@@ -390,7 +570,10 @@ def main() -> None:
         elapsed_hours = max(0.0, (now - first_dt).total_seconds() / 3600.0)
 
         first_change = float(prior.get("first_detected_change_12h", prior.get("change_12h", 0.0)))
-        if market not in qualified_markets:
+        watch = watch_by_market.get(market)
+        if watch is not None:
+            current_action = str(watch["action"])
+        elif market not in qualified_markets:
             current_action = "성과 추적"
         elif current_return >= SUCCESS_RETURN or float(row["change_12h"]) >= SUCCESS_RETURN:
             current_action = "추격 금지"
@@ -417,6 +600,7 @@ def main() -> None:
             ),
             "action": current_action,
             "detection_route": prior.get("detection_route", qualified_routes.get(market, "V3 이관")),
+            "engine_version": prior.get("engine_version", "LEGACY"),
         }
 
         if failure_at and (not success_at or failure_at == success_at):
@@ -491,24 +675,23 @@ def main() -> None:
             "elapsed_hours": 0.0,
             "status": "진행 중",
             "entry_quality": "정상 후보" if chase_risk < 6.0 else ("추격주의" if chase_risk < 10.0 else "추천 제외"),
-            "action": "매수 검토" if 1.5 <= chase_risk < 6.0 and float(row["change_1h"]) <= 6.0 else "눌림 대기",
+            "action": str(watch_by_market[market]["action"]),
             "detection_route": qualified_routes[market],
+            "engine_version": "V5",
+            "first_watch_at": watch_by_market[market]["first_watch_at"],
+            "first_watch_price": watch_by_market[market]["first_watch_price"],
         }
         tracking.append(episode)
         new_signals.append(episode)
 
-    # Candidate screen: only currently qualified episodes; tracking remains complete.
-    candidates: list[dict[str, Any]] = []
-    tracking_by_market = {row["market"]: row for row in tracking}
-    for market in qualified_markets:
-        candidate = tracking_by_market.get(market)
-        if candidate is not None:
-            candidates.append(candidate)
+    # The screen now shows persistent pre-pump states, not only instant signals.
+    candidates = [row for row in watchlist if row["watch_stage"] != "펌핑 후기"]
 
     candidates.sort(
         key=lambda row: (
             row["action"] != "매수 검토",
-            -row["score"],
+            -row["ignition_score"],
+            -row["preparation_score"],
             -row["relative_strength_percentile"],
             -row["trade_value_24h"],
         )
@@ -559,8 +742,13 @@ def main() -> None:
     success_count = sum(row.get("status") == "성공" for row in completed)
     failure_count = sum(row.get("status") == "실패" for row in completed)
     win_rate = round(success_count / (success_count + failure_count) * 100.0, 2) if success_count + failure_count else None
+    v5_completed = [row for row in completed if row.get("engine_version") == "V5"]
+    v5_success = sum(row.get("status") == "성공" for row in v5_completed)
+    v5_failure = sum(row.get("status") == "실패" for row in v5_completed)
+    v5_ongoing = sum(row.get("engine_version") == "V5" for row in tracking)
+    v5_win_rate = round(v5_success / (v5_success + v5_failure) * 100.0, 2) if v5_success + v5_failure else None
     result = {
-        "engine": "BES Momentum 15m V4 Dual Route",
+        "engine": "BES Momentum 15m V5 Persistent Watch",
         "scan_interval_minutes": 15,
         "updated_at": now_iso,
         "source": "Bithumb official public REST API",
@@ -578,8 +766,16 @@ def main() -> None:
             "win_rate_percent": win_rate,
             "rule": "+10% within 12h = success; -5% first or no +10% within 12h = failure",
         },
+        "performance_v5": {
+            "success_count": v5_success,
+            "failure_count": v5_failure,
+            "ongoing_count": v5_ongoing,
+            "win_rate_percent": v5_win_rate,
+            "rule": "+10% within 12h = success; -5% first or no +10% within 12h = failure",
+        },
         "risk_excluded_count": len(risk_exclusions),
         "candidates": candidates,
+        "watchlist": watchlist,
         "new_signals": new_signals,
         "tracking": tracking,
         "completed": completed,
@@ -592,6 +788,14 @@ def main() -> None:
     }
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    WATCH_STATE.write_text(
+        json.dumps(
+            {"engine": result["engine"], "updated_at": now_iso, "watchlist": watchlist},
+            ensure_ascii=False,
+            indent=2,
+        ) + "\n",
+        encoding="utf-8",
+    )
     print(json.dumps({
         "market_count": result["market_count"],
         "scanned_count": result["scanned_count"],
