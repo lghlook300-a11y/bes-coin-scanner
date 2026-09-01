@@ -33,6 +33,20 @@ COMPLETED_HISTORY_LIMIT = 1000
 WATCH_HOURS = 12
 MIN_WATCH_HOURS = 6
 MAX_WATCHLIST = 50
+PAPER_START_CASH = 1_000_000.0
+PAPER_POSITION_KRW = 200_000.0
+PAPER_MAX_POSITIONS = 3
+PAPER_FEE_RATE = 0.0004
+PAPER_SLIPPAGE_RATE = 0.001
+PAPER_HISTORY_LIMIT = 500
+PAPER_PENDING_MINUTES = 45
+
+PAPER_STRATEGIES = {
+    "A_EARLY": "A 초입형",
+    "B_BREAKOUT": "B 돌파형",
+    "C_PULLBACK": "C 눌림형",
+    "D_CHAMPION": "D 현행형",
+}
 
 
 def api_get(path: str, params: dict[str, Any] | None = None) -> Any:
@@ -438,7 +452,7 @@ def load_previous() -> dict[str, Any]:
     try:
         payload = json.loads(OUT.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return {"tracking": {}, "completed": []}
+        return {"tracking": {}, "completed": [], "paper_league": {}, "signal_memory": {}}
 
     tracking_rows = payload.get("tracking")
     if not isinstance(tracking_rows, list):
@@ -453,7 +467,12 @@ def load_previous() -> dict[str, Any]:
         row for row in payload.get("completed", [])
         if isinstance(row, dict) and "market" in row
     ]
-    return {"tracking": tracking, "completed": completed}
+    return {
+        "tracking": tracking,
+        "completed": completed,
+        "paper_league": payload.get("paper_league", {}),
+        "signal_memory": payload.get("signal_memory", {}),
+    }
 
 
 def parse_utc(value: Any) -> datetime | None:
@@ -493,6 +512,337 @@ def tracking_extremes(
         if success_at or failure_at:
             break
     return peak, mae, success_at, failure_at
+
+
+def update_signal_memory(
+    previous: Any,
+    scored_rows: dict[str, dict[str, Any]],
+    now: datetime,
+    now_iso: str,
+) -> dict[str, dict[str, Any]]:
+    prior_map = previous if isinstance(previous, dict) else {}
+    memory: dict[str, dict[str, Any]] = {}
+    for market, row in scored_rows.items():
+        prep = preparation_score(row)
+        ignition = ignition_score(row)
+        prior = prior_map.get(market, {}) if isinstance(prior_map.get(market, {}), dict) else {}
+        last_dt = parse_utc(prior.get("last_observed_at"))
+        fresh = last_dt is not None and now - last_dt < timedelta(hours=TRACK_HOURS)
+        early = float(row["change_1h"]) < 5.0 and float(row["change_12h"]) < 8.0
+        if not (prep >= 40 or ignition >= 30 or fresh):
+            continue
+        first_prep = prior.get("first_preparation_at")
+        first_ignition = prior.get("first_ignition_at")
+        if early and prep >= 55 and not first_prep:
+            first_prep = now_iso
+        if early and ignition >= 45 and not first_ignition:
+            first_ignition = now_iso
+        memory[market] = {
+            "market": market,
+            "symbol": row["symbol"],
+            "first_observed_at": prior.get("first_observed_at", now_iso),
+            "last_observed_at": now_iso,
+            "first_preparation_at": first_prep,
+            "first_ignition_at": first_ignition,
+            "first_observed_price": prior.get("first_observed_price", row["current_price"]),
+            "max_preparation_score": max(int(prior.get("max_preparation_score", 0)), prep),
+            "max_ignition_score": max(int(prior.get("max_ignition_score", 0)), ignition),
+            "earliest_change_12h": prior.get("earliest_change_12h", row["change_12h"]),
+            "current_change_12h": row["change_12h"],
+        }
+    return memory
+
+
+def strategy_signal(
+    strategy: str,
+    row: dict[str, Any],
+    watch: dict[str, Any] | None,
+) -> tuple[bool, str]:
+    if is_pump_late(row):
+        return False, "펌핑 후기"
+    if strategy == "A_EARLY":
+        ok = bool(
+            watch
+            and watch.get("watch_stage") == "점화"
+            and int(watch.get("preparation_score", 0)) >= 70
+            and int(watch.get("ignition_score", 0)) >= 55
+            and float(row["change_1h"]) < 5.0
+        )
+        return ok, "점화 단계"
+    if strategy == "B_BREAKOUT":
+        return bool(watch and watch.get("watch_stage") == "매수 검토"), "20시간 고점 돌파"
+    if strategy == "C_PULLBACK":
+        ok = bool(
+            watch
+            and watch.get("watch_stage") in {"돌파 임박", "매수 검토"}
+            and int(watch.get("ignition_score", 0)) >= 55
+            and -3.0 <= float(row["drawdown_from_high_4h"]) <= -0.3
+            and -1.0 <= float(row["change_15m"]) <= 0.3
+            and row["above_ema20"]
+        )
+        return ok, "고점 아래 첫 눌림"
+    if strategy == "D_CHAMPION":
+        return detection_route(row, int(row["score"])) is not None, "V4 현행 조건"
+    return False, "알 수 없는 전략"
+
+
+def empty_paper_account(strategy: str) -> dict[str, Any]:
+    return {
+        "strategy": strategy,
+        "name": PAPER_STRATEGIES[strategy],
+        "starting_cash": PAPER_START_CASH,
+        "cash": PAPER_START_CASH,
+        "open_positions": [],
+        "pending_orders": [],
+        "closed_trades": [],
+        "realized_pnl": 0.0,
+        "fees_paid": 0.0,
+        "peak_equity": PAPER_START_CASH,
+        "max_drawdown_percent": 0.0,
+        "day_start_date": None,
+        "day_start_equity": PAPER_START_CASH,
+    }
+
+
+def update_paper_league(
+    previous: Any,
+    scored_rows: dict[str, dict[str, Any]],
+    watchlist: list[dict[str, Any]],
+    now: datetime,
+    now_iso: str,
+) -> dict[str, Any]:
+    prior_accounts = previous.get("accounts", {}) if isinstance(previous, dict) else {}
+    watch_by_market = {row["market"]: row for row in watchlist}
+    accounts: dict[str, dict[str, Any]] = {}
+
+    for strategy in PAPER_STRATEGIES:
+        prior = prior_accounts.get(strategy, {}) if isinstance(prior_accounts, dict) else {}
+        account = {**empty_paper_account(strategy), **prior}
+        account["strategy"] = strategy
+        account["name"] = PAPER_STRATEGIES[strategy]
+        account["open_positions"] = list(account.get("open_positions", []))
+        account["pending_orders"] = list(account.get("pending_orders", []))
+        account["closed_trades"] = list(account.get("closed_trades", []))
+
+        still_open: list[dict[str, Any]] = []
+        for position in account["open_positions"]:
+            row = scored_rows.get(str(position.get("market")))
+            if row is None:
+                still_open.append(position)
+                continue
+            exit_price: float | None = None
+            exit_reason: str | None = None
+            last_checked = parse_utc(position.get("last_checked_at"))
+            for bar in row.get("_tracking_bars", []):
+                bar_dt = parse_utc(bar.get("time"))
+                if bar_dt is None or (last_checked is not None and bar_dt <= last_checked):
+                    continue
+                if float(bar["low"]) <= float(position["stop_price"]):
+                    exit_price = float(position["stop_price"])
+                    exit_reason = "손절 -5%"
+                    break
+                if float(bar["high"]) >= float(position["target_price"]):
+                    exit_price = float(position["target_price"])
+                    exit_reason = "목표 +10%"
+                    break
+            entered_at = parse_utc(position.get("entered_at"))
+            if exit_price is None and entered_at is not None and now - entered_at >= timedelta(hours=TRACK_HOURS):
+                exit_price = float(row["current_price"])
+                exit_reason = "12시간 종료"
+            if exit_price is None:
+                position["last_checked_at"] = now_iso
+                position["current_price"] = row["current_price"]
+                position["unrealized_return_percent"] = round(
+                    pct_change(float(row["current_price"]), float(position["entry_fill_price"])), 4
+                )
+                still_open.append(position)
+                continue
+
+            sell_fill = exit_price * (1.0 - PAPER_SLIPPAGE_RATE)
+            gross = float(position["quantity"]) * sell_fill
+            exit_fee = gross * PAPER_FEE_RATE
+            net = gross - exit_fee
+            pnl = net - float(position["total_entry_cost"])
+            account["cash"] = float(account["cash"]) + net
+            account["realized_pnl"] = float(account.get("realized_pnl", 0.0)) + pnl
+            account["fees_paid"] = float(account.get("fees_paid", 0.0)) + exit_fee
+            account["closed_trades"].append({
+                **position,
+                "exit_at": now_iso,
+                "exit_price": round(exit_price, 12),
+                "exit_fill_price": round(sell_fill, 12),
+                "exit_fee": round(exit_fee, 4),
+                "pnl": round(pnl, 4),
+                "return_percent": round(pnl / float(position["total_entry_cost"]) * 100.0, 4),
+                "exit_reason": exit_reason,
+            })
+        account["open_positions"] = still_open
+
+        retained_pending: list[dict[str, Any]] = []
+        for order in account["pending_orders"]:
+            row = scored_rows.get(str(order.get("market")))
+            created_at = parse_utc(order.get("created_at"))
+            if created_at is not None and now - created_at > timedelta(minutes=PAPER_PENDING_MINUTES):
+                continue
+            if row is None or created_at is None or created_at >= now:
+                retained_pending.append(order)
+                continue
+            if is_pump_late(row) or float(row["current_price"]) > float(order["signal_price"]) * 1.03:
+                continue
+            if len(account["open_positions"]) >= PAPER_MAX_POSITIONS:
+                retained_pending.append(order)
+                continue
+            gross_budget = min(
+                PAPER_POSITION_KRW,
+                float(account["cash"]) / (1.0 + PAPER_FEE_RATE),
+            )
+            if gross_budget < 10_000.0:
+                retained_pending.append(order)
+                continue
+            fill = float(row["current_price"]) * (1.0 + PAPER_SLIPPAGE_RATE)
+            quantity = gross_budget / fill
+            entry_fee = gross_budget * PAPER_FEE_RATE
+            total_cost = gross_budget + entry_fee
+            account["cash"] = float(account["cash"]) - total_cost
+            account["fees_paid"] = float(account.get("fees_paid", 0.0)) + entry_fee
+            account["open_positions"].append({
+                "market": row["market"],
+                "symbol": row["symbol"],
+                "signal_at": order["created_at"],
+                "signal_price": order["signal_price"],
+                "signal_reason": order["signal_reason"],
+                "entered_at": now_iso,
+                "entry_market_price": row["current_price"],
+                "entry_fill_price": round(fill, 12),
+                "quantity": quantity,
+                "gross_budget": round(gross_budget, 4),
+                "entry_fee": round(entry_fee, 4),
+                "total_entry_cost": round(total_cost, 4),
+                "stop_price": round(fill * 0.95, 12),
+                "target_price": round(fill * 1.10, 12),
+                "last_checked_at": now_iso,
+                "current_price": row["current_price"],
+                "unrealized_return_percent": round(pct_change(float(row["current_price"]), fill), 4),
+            })
+        account["pending_orders"] = retained_pending
+
+        occupied = {str(row["market"]) for row in account["open_positions"]}
+        occupied |= {str(row["market"]) for row in account["pending_orders"]}
+        recently_closed = {
+            str(row["market"])
+            for row in account["closed_trades"]
+            if parse_utc(row.get("exit_at")) is not None
+            and now - parse_utc(row.get("exit_at")) < timedelta(hours=TRACK_HOURS)
+        }
+        signal_candidates: list[tuple[float, str, dict[str, Any], str]] = []
+        for market, row in scored_rows.items():
+            if market in occupied or market in recently_closed:
+                continue
+            signal, reason = strategy_signal(strategy, row, watch_by_market.get(market))
+            if signal:
+                watch = watch_by_market.get(market, {})
+                if strategy == "A_EARLY":
+                    priority = float(watch.get("preparation_score", 0)) + float(watch.get("ignition_score", 0))
+                elif strategy in {"B_BREAKOUT", "C_PULLBACK"}:
+                    priority = float(watch.get("ignition_score", 0))
+                else:
+                    priority = float(row.get("score", 0))
+                signal_candidates.append((priority, market, row, reason))
+        available_slots = max(0, PAPER_MAX_POSITIONS - len(account["open_positions"]) - len(account["pending_orders"]))
+        for _, market, row, reason in sorted(signal_candidates, reverse=True)[:available_slots]:
+                account["pending_orders"].append({
+                    "market": market,
+                    "symbol": row["symbol"],
+                    "created_at": now_iso,
+                    "signal_price": row["current_price"],
+                    "signal_reason": reason,
+                })
+                occupied.add(market)
+
+        market_value = 0.0
+        unrealized = 0.0
+        for position in account["open_positions"]:
+            row = scored_rows.get(str(position["market"]))
+            price = float(row["current_price"]) if row else float(position.get("current_price", position["entry_fill_price"]))
+            liquidation = float(position["quantity"]) * price * (1.0 - PAPER_SLIPPAGE_RATE) * (1.0 - PAPER_FEE_RATE)
+            market_value += liquidation
+            unrealized += liquidation - float(position["total_entry_cost"])
+        equity = float(account["cash"]) + market_value
+        kst_date = (now + timedelta(hours=9)).date().isoformat()
+        prior_equity = float(prior.get("equity", PAPER_START_CASH))
+        if account.get("day_start_date") != kst_date:
+            account["day_start_date"] = kst_date
+            account["day_start_equity"] = prior_equity
+        day_start_equity = float(account.get("day_start_equity", prior_equity))
+        peak_equity = max(float(account.get("peak_equity", PAPER_START_CASH)), equity)
+        drawdown = pct_change(equity, peak_equity)
+        closed_trades = account["closed_trades"][-PAPER_HISTORY_LIMIT:]
+        wins = [row for row in closed_trades if float(row.get("pnl", 0.0)) > 0]
+        losses = [row for row in closed_trades if float(row.get("pnl", 0.0)) <= 0]
+        gross_profit = sum(float(row.get("pnl", 0.0)) for row in wins)
+        gross_loss = abs(sum(float(row.get("pnl", 0.0)) for row in losses))
+        today_closed = [
+            row for row in closed_trades
+            if parse_utc(row.get("exit_at")) is not None
+            and (parse_utc(row.get("exit_at")) + timedelta(hours=9)).date().isoformat() == kst_date
+        ]
+        loss_reasons: dict[str, float] = {}
+        for trade in today_closed:
+            if float(trade.get("pnl", 0.0)) >= 0:
+                continue
+            reason = f'{trade.get("exit_reason", "기타")} · {trade.get("signal_reason", "신호")}'
+            loss_reasons[reason] = loss_reasons.get(reason, 0.0) + float(trade["pnl"])
+        account.update({
+            "cash": round(float(account["cash"]), 4),
+            "market_value": round(market_value, 4),
+            "equity": round(equity, 4),
+            "total_return_percent": round(pct_change(equity, PAPER_START_CASH), 4),
+            "daily_pnl": round(equity - day_start_equity, 4),
+            "daily_return_percent": round(pct_change(equity, day_start_equity), 4),
+            "unrealized_pnl": round(unrealized, 4),
+            "realized_pnl": round(float(account.get("realized_pnl", 0.0)), 4),
+            "fees_paid": round(float(account.get("fees_paid", 0.0)), 4),
+            "peak_equity": round(peak_equity, 4),
+            "max_drawdown_percent": round(min(float(account.get("max_drawdown_percent", 0.0)), drawdown), 4),
+            "win_count": len(wins),
+            "loss_count": len(losses),
+            "win_rate_percent": round(len(wins) / len(closed_trades) * 100.0, 2) if closed_trades else None,
+            "profit_factor": round(gross_profit / gross_loss, 4) if gross_loss > 0 else None,
+            "daily_loss_reasons": [
+                {"reason": reason, "pnl": round(pnl, 4)}
+                for reason, pnl in sorted(loss_reasons.items(), key=lambda item: item[1])
+            ],
+            "updated_at": now_iso,
+            "closed_trades": closed_trades,
+        })
+        accounts[strategy] = account
+
+    ranking = sorted(
+        (
+            {
+                "strategy": key,
+                "name": value["name"],
+                "equity": value["equity"],
+                "total_return_percent": value["total_return_percent"],
+                "max_drawdown_percent": value["max_drawdown_percent"],
+                "closed_trade_count": len(value["closed_trades"]),
+            }
+            for key, value in accounts.items()
+        ),
+        key=lambda row: (-float(row["equity"]), -float(row["max_drawdown_percent"])),
+    )
+    return {
+        "mode": "모의매매 전용·실제 주문 없음",
+        "starting_cash_per_account": PAPER_START_CASH,
+        "fee_rate_each_side": PAPER_FEE_RATE,
+        "slippage_rate_each_side": PAPER_SLIPPAGE_RATE,
+        "max_positions": PAPER_MAX_POSITIONS,
+        "position_krw": PAPER_POSITION_KRW,
+        "pending_order_expiry_minutes": PAPER_PENDING_MINUTES,
+        "updated_at": now_iso,
+        "accounts": accounts,
+        "ranking": ranking,
+    }
 
 
 def main() -> None:
@@ -548,6 +898,10 @@ def main() -> None:
         scored_rows[row["market"]] = scored
     watchlist = update_watch_state(scored_rows, now, now_iso)
     watch_by_market = {row["market"]: row for row in watchlist}
+    signal_memory = update_signal_memory(state.get("signal_memory"), scored_rows, now, now_iso)
+    paper_league = update_paper_league(
+        state.get("paper_league"), scored_rows, watchlist, now, now_iso
+    )
     for item in watchlist:
         if item["watch_stage"] in {"점화", "돌파 임박", "매수 검토"}:
             qualified_routes[item["market"]] = str(item["watch_stage"])
@@ -712,6 +1066,7 @@ def main() -> None:
             "change_12h": row["change_12h"],
             "score": row["score"],
             "reason": "; ".join(exclusion_reasons(row, int(row["score"]))),
+            "pre_signal_memory": signal_memory.get(row["market"]),
         }
         for row in leaders
         if row["market"] not in detected_markets
@@ -776,6 +1131,8 @@ def main() -> None:
         "risk_excluded_count": len(risk_exclusions),
         "candidates": candidates,
         "watchlist": watchlist,
+        "signal_memory": signal_memory,
+        "paper_league": paper_league,
         "new_signals": new_signals,
         "tracking": tracking,
         "completed": completed,
