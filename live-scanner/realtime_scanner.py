@@ -213,7 +213,7 @@ def classify(coin: Coin, row: dict[str, float], flow_percentile: float, now: int
     if coin.first_seen_price:
         coin.peak_price = max(coin.peak_price or price, price)
         coin.trough_price = min(coin.trough_price or price, price)
-    if coin.state == "상승 가능":
+    if coin.state in {"수급 유입", "상승 가능"}:
         if coin.candidate_confirmed_at is None:
             coin.candidate_confirmed_at = now
         coin.candidate_hold_until = now + CANDIDATE_HOLD_MS
@@ -242,10 +242,10 @@ def public_coin(coin: Coin, row: dict[str, float]) -> dict[str, Any]:
     now = int(time.time() * 1000)
     if coin.state == "과열·추격 금지":
         action = "눌림 대기"
-    elif coin.state == "상승 가능" or (
-        coin.candidate_hold_until > now and coin.state != "수급 이탈"
-    ):
+    elif coin.state == "상승 가능":
         action = "매수 검토"
+    elif coin.candidate_hold_until > now and coin.state != "수급 이탈":
+        action = "관찰"
     else:
         action = "매수 금지"
     return {
@@ -438,11 +438,11 @@ class Scanner:
     def snapshot(self) -> dict[str, Any]:
         now = int(time.time() * 1000)
         rows = [public_coin(coin, self.latest.get(code, {})) for code, coin in self.coins.items() if code in self.latest]
-        action_order = {"매수 검토": 0, "눌림 대기": 1, "매수 금지": 2}
+        action_order = {"매수 검토": 0, "관찰": 1, "눌림 대기": 2, "매수 금지": 3}
         rows = [
             row for row in rows
             if row["candidate_confirmed_at"]
-            and (row["state"] == "상승 가능" or row["candidate_hold_until"] > now)
+            and (row["state"] in {"수급 유입", "상승 가능"} or row["candidate_hold_until"] > now)
             and row["state"] != "수급 이탈"
         ]
         rows.sort(key=lambda row: (action_order[row["action"]], -row["score"], -(row["candidate_confirmed_at"] or 0)))
