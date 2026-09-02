@@ -35,6 +35,7 @@ ACTIVE_STATE_LOCK_MS = 30_000
 OTHER_STATE_LOCK_MS = 10_000
 CHART_WINDOW_MS = 3 * 60_000
 CHART_BUCKET_MS = 5_000
+CANDIDATE_HOLD_MS = 3 * 60_000
 STATE_STRENGTH = {"일반 감시": 0, "관찰 유지": 1, "수급 유입": 2, "상승 가능": 3}
 
 
@@ -70,6 +71,8 @@ class Coin:
     pending_state: str | None = None
     pending_since: int = 0
     locked_until: int = 0
+    candidate_confirmed_at: int | None = None
+    candidate_hold_until: int = 0
 
 
 def pct(new: float, old: float) -> float:
@@ -207,7 +210,15 @@ def classify(coin: Coin, row: dict[str, float], flow_percentile: float, now: int
     if coin.first_seen_price:
         coin.peak_price = max(coin.peak_price or price, price)
         coin.trough_price = min(coin.trough_price or price, price)
+    if coin.state == "상승 가능":
+        if coin.candidate_confirmed_at is None:
+            coin.candidate_confirmed_at = now
+        coin.candidate_hold_until = now + CANDIDATE_HOLD_MS
     if coin.state != previous:
+        if coin.state == "상승 가능":
+            coin.candidate_confirmed_at = coin.candidate_confirmed_at or now
+        elif coin.state == "수급 이탈":
+            coin.candidate_hold_until = 0
         return {"timestamp_ms": now, "market": coin.market, "state": coin.state, "score": coin.score, "price": price}
     return None
 
@@ -225,10 +236,17 @@ def chart_prices(coin: Coin) -> list[list[float | int]]:
 
 def public_coin(coin: Coin, row: dict[str, float]) -> dict[str, Any]:
     price = row.get("price", 0.0)
+    if coin.state == "상승 가능":
+        action = "매수 검토"
+    elif coin.state == "과열·추격 금지":
+        action = "눌림 대기"
+    else:
+        action = "매수 금지"
     return {
         "market": coin.market,
         "symbol": coin.market.split("-", 1)[1],
         "state": coin.state,
+        "action": action,
         "score": coin.score,
         "current_price": price,
         "first_seen_at": coin.first_seen_at,
@@ -247,6 +265,8 @@ def public_coin(coin: Coin, row: dict[str, float]) -> dict[str, Any]:
         "change_3m": round(row.get("change_3m", 0.0), 3),
         "last_change_at": coin.last_change_at,
         "state_since": coin.state_since,
+        "candidate_confirmed_at": coin.candidate_confirmed_at,
+        "candidate_hold_until": coin.candidate_hold_until,
         "confirmed_for_seconds": max(0, int((time.time() * 1000 - coin.state_since) / 1000)) if coin.state_since else 0,
         "pending_state": coin.pending_state,
         "pending_for_seconds": max(0, int((time.time() * 1000 - coin.pending_since) / 1000)) if coin.pending_since else 0,
@@ -291,6 +311,7 @@ class Scanner:
         fields = (
             "state", "score", "first_seen_at", "first_seen_price", "peak_price", "trough_price",
             "last_change_at", "state_since", "pending_state", "pending_since", "locked_until",
+            "candidate_confirmed_at", "candidate_hold_until",
         )
         for code, values in saved.items():
             coin = self.coins.get(code)
@@ -316,6 +337,8 @@ class Scanner:
                     "pending_state": coin.pending_state,
                     "pending_since": coin.pending_since,
                     "locked_until": coin.locked_until,
+                    "candidate_confirmed_at": coin.candidate_confirmed_at,
+                    "candidate_hold_until": coin.candidate_hold_until,
                 }
                 for code, coin in self.coins.items()
             }
@@ -407,18 +430,25 @@ class Scanner:
             delay = min(delay * 2, 30)
 
     def snapshot(self) -> dict[str, Any]:
+        now = int(time.time() * 1000)
         rows = [public_coin(coin, self.latest.get(code, {})) for code, coin in self.coins.items() if code in self.latest]
-        order = {"상승 가능": 0, "수급 유입": 1, "관찰 유지": 2, "과열·추격 금지": 3, "수급 이탈": 4}
-        rows = [row for row in rows if row["state"] != "일반 감시"]
-        rows.sort(key=lambda row: (order.get(row["state"], 9), -row["score"]))
+        action_order = {"매수 검토": 0, "눌림 대기": 1, "매수 금지": 2}
+        rows = [
+            row for row in rows
+            if row["candidate_confirmed_at"]
+            and (row["state"] == "상승 가능" or row["candidate_hold_until"] > now)
+            and row["state"] != "수급 이탈"
+        ]
+        rows.sort(key=lambda row: (action_order[row["action"]], -row["score"], -(row["candidate_confirmed_at"] or 0)))
+        top_rows = rows[:3]
         return {
-            "engine": "BES Real-time Capital Flow Scanner V1.1 Stable",
+            "engine": "BES Real-time Confirmed TOP 3 V1.2",
             "connected": self.connected,
             "updated_at_ms": self.updated_at,
             "market_count": len(self.coins),
-            "rising_count": sum(row["state"] == "상승 가능" for row in rows),
-            "inflow_count": sum(row["state"] == "수급 유입" for row in rows),
-            "results": rows[:100],
+            "candidate_count": len(rows),
+            "buy_review_count": sum(row["action"] == "매수 검토" for row in rows),
+            "results": top_rows,
             "events": self.events[-100:],
         }
 
