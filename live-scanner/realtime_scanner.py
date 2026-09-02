@@ -23,6 +23,19 @@ STATE_FILE = DATA_DIR / "scanner_state.json"
 EVENT_FILE = DATA_DIR / "events.jsonl"
 STATIC_DIR = Path(__file__).with_name("static")
 STABLE = {"USDT", "USDC", "DAI", "TUSD", "FDUSD", "USDE", "PYUSD"}
+STATE_CONFIRM_MS = {
+    "수급 유입": 10_000,
+    "상승 가능": 15_000,
+    "관찰 유지": 12_000,
+    "수급 이탈": 3_000,
+    "일반 감시": 20_000,
+    "과열·추격 금지": 0,
+}
+ACTIVE_STATE_LOCK_MS = 30_000
+OTHER_STATE_LOCK_MS = 10_000
+CHART_WINDOW_MS = 3 * 60_000
+CHART_BUCKET_MS = 5_000
+STATE_STRENGTH = {"일반 감시": 0, "관찰 유지": 1, "수급 유입": 2, "상승 가능": 3}
 
 
 @dataclass
@@ -53,6 +66,10 @@ class Coin:
     peak_price: float | None = None
     trough_price: float | None = None
     last_change_at: int = 0
+    state_since: int = 0
+    pending_state: str | None = None
+    pending_since: int = 0
+    locked_until: int = 0
 
 
 def pct(new: float, old: float) -> float:
@@ -119,10 +136,9 @@ def score_signal(row: dict[str, float], flow_percentile: float) -> int:
     return round(clip(score, 0.0, 100.0))
 
 
-def classify(coin: Coin, row: dict[str, float], flow_percentile: float, now: int) -> dict[str, Any] | None:
-    previous = coin.state
+def desired_state(coin: Coin, row: dict[str, float], flow_percentile: float) -> str:
     coin.score = score_signal(row, flow_percentile)
-    overheat = row["change_1m"] >= 8.0 or row["change_3m"] >= 12.0
+    overheat = row["change_30s"] >= 3.5 or row["change_1m"] >= 5.0 or row["change_3m"] >= 10.0
     outflow = (
         previous in {"수급 유입", "상승 가능", "과열·추격 금지"}
         and row["buy_30s"] < 0.43
@@ -138,17 +154,49 @@ def classify(coin: Coin, row: dict[str, float], flow_percentile: float, now: int
         and row["spread"] <= 0.8
     )
     if outflow:
-        coin.state = "수급 이탈"
-    elif overheat:
-        coin.state = "과열·추격 금지"
-    elif rising:
-        coin.state = "상승 가능"
-    elif coin.score >= 60:
-        coin.state = "수급 유입"
-    elif previous != "일반 감시" and coin.score >= 40:
-        coin.state = "관찰 유지"
+        return "수급 이탈"
+    if overheat:
+        return "과열·추격 금지"
+    if rising:
+        return "상승 가능"
+    if coin.score >= 60:
+        return "수급 유입"
+    if coin.state != "일반 감시" and coin.score >= 40:
+        return "관찰 유지"
+    return "일반 감시"
+
+
+def classify(coin: Coin, row: dict[str, float], flow_percentile: float, now: int) -> dict[str, Any] | None:
+    previous = coin.state
+    wanted = desired_state(coin, row, flow_percentile)
+    safety_override = wanted in {"과열·추격 금지", "수급 이탈"}
+
+    if wanted == previous:
+        coin.pending_state = None
+        coin.pending_since = 0
+    elif (
+        now < coin.locked_until
+        and not safety_override
+        and STATE_STRENGTH.get(wanted, 0) <= STATE_STRENGTH.get(previous, 0)
+    ):
+        coin.pending_state = None
+        coin.pending_since = 0
     else:
-        coin.state = "일반 감시"
+        if coin.pending_state != wanted:
+            coin.pending_state = wanted
+            coin.pending_since = now
+        required = STATE_CONFIRM_MS[wanted]
+        if now - coin.pending_since >= required:
+            coin.state = wanted
+            coin.state_since = now
+            coin.last_change_at = now
+            coin.locked_until = now + (
+                ACTIVE_STATE_LOCK_MS
+                if wanted in {"수급 유입", "상승 가능"}
+                else OTHER_STATE_LOCK_MS
+            )
+            coin.pending_state = None
+            coin.pending_since = 0
 
     price = row["price"]
     if coin.state in {"수급 유입", "상승 가능"} and coin.first_seen_at is None:
@@ -160,9 +208,19 @@ def classify(coin: Coin, row: dict[str, float], flow_percentile: float, now: int
         coin.peak_price = max(coin.peak_price or price, price)
         coin.trough_price = min(coin.trough_price or price, price)
     if coin.state != previous:
-        coin.last_change_at = now
         return {"timestamp_ms": now, "market": coin.market, "state": coin.state, "score": coin.score, "price": price}
     return None
+
+
+def chart_prices(coin: Coin) -> list[list[float | int]]:
+    if not coin.ticks:
+        return []
+    cutoff = coin.ticks[-1].ts - CHART_WINDOW_MS
+    buckets: dict[int, Tick] = {}
+    for tick in coin.ticks:
+        if tick.ts >= cutoff:
+            buckets[tick.ts // CHART_BUCKET_MS] = tick
+    return [[tick.ts, round(tick.price, 8)] for tick in buckets.values()]
 
 
 def public_coin(coin: Coin, row: dict[str, float]) -> dict[str, Any]:
@@ -182,11 +240,17 @@ def public_coin(coin: Coin, row: dict[str, float]) -> dict[str, Any]:
         "flow_1m": round(row.get("flow_1m", 0.0), 2),
         "flow_3m": round(row.get("flow_3m", 0.0), 2),
         "buy_ratio_30s": round(row.get("buy_30s", 0.5) * 100.0, 1),
+        "buy_ratio_1m": round(row.get("buy_1m", 0.5) * 100.0, 1),
         "orderbook_buy_ratio": round(row.get("book_buy", 0.5) * 100.0, 1),
         "change_30s": round(row.get("change_30s", 0.0), 3),
         "change_1m": round(row.get("change_1m", 0.0), 3),
         "change_3m": round(row.get("change_3m", 0.0), 3),
         "last_change_at": coin.last_change_at,
+        "state_since": coin.state_since,
+        "confirmed_for_seconds": max(0, int((time.time() * 1000 - coin.state_since) / 1000)) if coin.state_since else 0,
+        "pending_state": coin.pending_state,
+        "pending_for_seconds": max(0, int((time.time() * 1000 - coin.pending_since) / 1000)) if coin.pending_since else 0,
+        "chart_prices": chart_prices(coin),
     }
 
 
@@ -224,7 +288,10 @@ class Scanner:
             saved = json.loads(STATE_FILE.read_text(encoding="utf-8")).get("coins", {})
         except (OSError, ValueError, AttributeError):
             return
-        fields = ("state", "score", "first_seen_at", "first_seen_price", "peak_price", "trough_price", "last_change_at")
+        fields = (
+            "state", "score", "first_seen_at", "first_seen_price", "peak_price", "trough_price",
+            "last_change_at", "state_since", "pending_state", "pending_since", "locked_until",
+        )
         for code, values in saved.items():
             coin = self.coins.get(code)
             if coin is None or not isinstance(values, dict):
@@ -245,6 +312,10 @@ class Scanner:
                     "peak_price": coin.peak_price,
                     "trough_price": coin.trough_price,
                     "last_change_at": coin.last_change_at,
+                    "state_since": coin.state_since,
+                    "pending_state": coin.pending_state,
+                    "pending_since": coin.pending_since,
+                    "locked_until": coin.locked_until,
                 }
                 for code, coin in self.coins.items()
             }
@@ -341,7 +412,7 @@ class Scanner:
         rows = [row for row in rows if row["state"] != "일반 감시"]
         rows.sort(key=lambda row: (order.get(row["state"], 9), -row["score"]))
         return {
-            "engine": "BES Real-time Capital Flow Scanner V1",
+            "engine": "BES Real-time Capital Flow Scanner V1.1 Stable",
             "connected": self.connected,
             "updated_at_ms": self.updated_at,
             "market_count": len(self.coins),
