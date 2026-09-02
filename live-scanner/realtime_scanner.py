@@ -14,6 +14,7 @@ import uuid
 from typing import Any
 
 from aiohttp import ClientSession, WSMsgType, web
+import legacy_scanner
 
 
 REST_API = "https://api.bithumb.com/v1"
@@ -21,6 +22,8 @@ WS_API = "wss://ws-api.bithumb.com/websocket/v1"
 DATA_DIR = Path(os.environ.get("BES_DATA_DIR", "data-live"))
 STATE_FILE = DATA_DIR / "scanner_state.json"
 EVENT_FILE = DATA_DIR / "events.jsonl"
+LEGACY_FILE = DATA_DIR / "legacy_latest.json"
+LEGACY_WATCH_FILE = DATA_DIR / "legacy_watch_state.json"
 STATIC_DIR = Path(__file__).with_name("static")
 STABLE = {"USDT", "USDC", "DAI", "TUSD", "FDUSD", "USDE", "PYUSD"}
 STATE_CONFIRM_MS = {
@@ -452,6 +455,38 @@ class Scanner:
             "events": self.events[-100:],
         }
 
+    def legacy_snapshot(self) -> dict[str, Any]:
+        try:
+            return json.loads(LEGACY_FILE.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {
+                "engine": "BES Momentum 15m",
+                "updated_at": None,
+                "market_count": len(self.coins),
+                "scanned_count": 0,
+                "active_count": 0,
+                "actionable_count": 0,
+                "candidates": [],
+                "status": "첫 15분 검사 진행 중",
+            }
+
+    async def legacy_scan_loop(self) -> None:
+        legacy_scanner.OUT = LEGACY_FILE
+        legacy_scanner.WATCH_STATE = LEGACY_WATCH_FILE
+        while True:
+            started = time.monotonic()
+            try:
+                await asyncio.to_thread(legacy_scanner.main)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.events.append({
+                    "timestamp_ms": int(time.time() * 1000),
+                    "state": "15분 검색 오류",
+                    "error": str(exc),
+                })
+            await asyncio.sleep(max(5.0, 900.0 - (time.monotonic() - started)))
+
 
 async def main() -> None:
     scanner = Scanner()
@@ -459,12 +494,13 @@ async def main() -> None:
         await scanner.bootstrap(session)
         app = web.Application()
         app.router.add_get("/api/state", lambda _: web.json_response(scanner.snapshot()))
+        app.router.add_get("/api/legacy-state", lambda _: web.json_response(scanner.legacy_snapshot()))
         app.router.add_get("/health", lambda _: web.json_response({"ok": scanner.connected, "markets": len(scanner.coins)}))
         app.router.add_static("/", STATIC_DIR, show_index=True)
         runner = web.AppRunner(app)
         await runner.setup()
         await web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", "8080"))).start()
-        await asyncio.gather(scanner.stream(session), scanner.evaluate(), scanner.save_loop())
+        await asyncio.gather(scanner.stream(session), scanner.evaluate(), scanner.save_loop(), scanner.legacy_scan_loop())
 
 
 if __name__ == "__main__":
