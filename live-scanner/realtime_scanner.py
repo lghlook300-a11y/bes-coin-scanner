@@ -140,7 +140,7 @@ def desired_state(coin: Coin, row: dict[str, float], flow_percentile: float) -> 
     coin.score = score_signal(row, flow_percentile)
     overheat = row["change_30s"] >= 3.5 or row["change_1m"] >= 5.0 or row["change_3m"] >= 10.0
     outflow = (
-        previous in {"수급 유입", "상승 가능", "과열·추격 금지"}
+        coin.state in {"수급 유입", "상승 가능", "과열·추격 금지"}
         and row["buy_30s"] < 0.43
         and row["change_30s"] < -0.40
     )
