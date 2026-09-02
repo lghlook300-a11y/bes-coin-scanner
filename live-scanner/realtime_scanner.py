@@ -239,10 +239,13 @@ def chart_prices(coin: Coin) -> list[list[float | int]]:
 
 def public_coin(coin: Coin, row: dict[str, float]) -> dict[str, Any]:
     price = row.get("price", 0.0)
-    if coin.state == "상승 가능":
-        action = "매수 검토"
-    elif coin.state == "과열·추격 금지":
+    now = int(time.time() * 1000)
+    if coin.state == "과열·추격 금지":
         action = "눌림 대기"
+    elif coin.state == "상승 가능" or (
+        coin.candidate_hold_until > now and coin.state != "수급 이탈"
+    ):
+        action = "매수 검토"
     else:
         action = "매수 금지"
     return {
