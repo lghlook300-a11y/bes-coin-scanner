@@ -41,6 +41,7 @@ PAPER_SLIPPAGE_RATE = 0.001
 PAPER_HISTORY_LIMIT = 500
 PAPER_PENDING_MINUTES = 45
 MIN_ROTATION_PRICE = 0.01
+SAFETY_RESEARCH_ONLY = True
 
 PAPER_STRATEGIES = {
     "A_EARLY": "A 초입형",
@@ -223,6 +224,61 @@ def score_row(row: dict[str, Any], relative_strength: float) -> dict[str, Any]:
             "liquidity": round(liquidity, 1),
             "wick_penalty": round(wick_penalty, 1),
         },
+    }
+
+
+def btc_market_context(row: dict[str, Any] | None) -> dict[str, Any]:
+    """Conservative market gate used for research; it never issues a buy signal."""
+    if row is None:
+        return {"state": "데이터 없음", "allows_entry": False, "reasons": ["BTC 데이터 없음"]}
+    reasons: list[str] = []
+    if float(row["change_4h"]) <= 0.0:
+        reasons.append("BTC 4시간 하락")
+    if float(row["change_12h"]) <= 0.0:
+        reasons.append("BTC 12시간 하락")
+    if not bool(row["above_ema20"]):
+        reasons.append("BTC 20시간 추세선 아래")
+    allows_entry = not reasons
+    return {
+        "state": "회복 확인" if allows_entry else "위험·관찰만",
+        "allows_entry": allows_entry,
+        "reasons": reasons,
+        "change_4h": round(float(row["change_4h"]), 4),
+        "change_12h": round(float(row["change_12h"]), 4),
+        "above_ema20": bool(row["above_ema20"]),
+    }
+
+
+def safety_risk_reasons(row: dict[str, Any], btc: dict[str, Any]) -> list[str]:
+    """Record conservative exclusions for later validation, without claiming safety."""
+    reasons = list(btc.get("reasons", []))
+    if float(row["change_12h"]) >= 8.0:
+        reasons.append("최근 12시간 급등")
+    if float(row["change_4h"]) <= -2.0:
+        reasons.append("종목 4시간 하락")
+    if not bool(row["above_ema20"]):
+        reasons.append("종목 20시간 추세선 아래")
+    if int(row["higher_low_count"]) < 1:
+        reasons.append("저점 방어 미확인")
+    if not bool(row["obv_improving_4h"]):
+        reasons.append("4시간 자금흐름 개선 미확인")
+    if float(row["upper_wick_ratio"]) > 0.45:
+        reasons.append("긴 윗꼬리")
+    return reasons
+
+
+def initial_research_snapshot(row: dict[str, Any], btc: dict[str, Any]) -> dict[str, Any]:
+    fields = (
+        "change_15m", "change_1h", "change_4h", "change_12h",
+        "value_ratio_15m", "value_ratio_1h", "value_ratio_4h",
+        "distance_to_high_4h", "distance_from_ema20", "above_ema20",
+        "higher_low_count", "obv_improving_4h", "close_position",
+        "upper_wick_ratio", "trade_value_24h", "score",
+    )
+    return {
+        "features": {name: row.get(name) for name in fields},
+        "btc": btc,
+        "risk_reasons": safety_risk_reasons(row, btc),
     }
 
 
@@ -1014,6 +1070,12 @@ def main() -> None:
         scored = score_row(row, strength)
         scored_rows[row["market"]] = scored
     watchlist = update_watch_state(scored_rows, now, now_iso)
+    btc_context = btc_market_context(scored_rows.get("KRW-BTC"))
+    for item in watchlist:
+        item["original_action"] = item["action"]
+        item["risk_reasons"] = safety_risk_reasons(item, btc_context)
+        item["action"] = "위험 제외" if item["risk_reasons"] else "연구 관찰"
+        item["btc_market_state"] = btc_context["state"]
     watch_by_market = {row["market"]: row for row in watchlist}
     signal_memory = update_signal_memory(state.get("signal_memory"), scored_rows, now, now_iso)
     market_monitor, rotation_watch = build_market_monitor(scored_rows, signal_memory)
@@ -1152,6 +1214,7 @@ def main() -> None:
             "engine_version": "V5.1",
             "first_watch_at": watch_by_market[market]["first_watch_at"],
             "first_watch_price": watch_by_market[market]["first_watch_price"],
+            "initial_research_snapshot": initial_research_snapshot(row, btc_context),
         }
         tracking.append(episode)
         new_signals.append(episode)
@@ -1170,7 +1233,7 @@ def main() -> None:
         )
     )
     candidates = candidates[:MAX_RESULTS]
-    actionable_count = sum(row["action"] == "매수 검토" for row in candidates)
+    actionable_count = 0
     leaders = sorted(
         (public_row(row) for row in scored_rows.values()),
         key=lambda row: float(row["change_12h"]),
@@ -1216,13 +1279,15 @@ def main() -> None:
     success_count = sum(row.get("status") == "성공" for row in completed)
     failure_count = sum(row.get("status") == "실패" for row in completed)
     win_rate = round(success_count / (success_count + failure_count) * 100.0, 2) if success_count + failure_count else None
-    v5_completed = [row for row in completed if row.get("engine_version") == "V5"]
+    v5_completed = [row for row in completed if str(row.get("engine_version", "")).startswith("V5")]
     v5_success = sum(row.get("status") == "성공" for row in v5_completed)
     v5_failure = sum(row.get("status") == "실패" for row in v5_completed)
-    v5_ongoing = sum(row.get("engine_version") == "V5" for row in tracking)
+    v5_ongoing = sum(str(row.get("engine_version", "")).startswith("V5") for row in tracking)
     v5_win_rate = round(v5_success / (v5_success + v5_failure) * 100.0, 2) if v5_success + v5_failure else None
     result = {
-        "engine": "BES Momentum 15m V5.1 Rotation Challenger",
+        "engine": "BES Safety Research V0.1",
+        "mode": "검증 전용·매수 신호 없음",
+        "btc_market": btc_context,
         "scan_interval_minutes": 15,
         "updated_at": now_iso,
         "source": "Bithumb official public REST API",
