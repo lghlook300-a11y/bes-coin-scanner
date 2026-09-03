@@ -73,6 +73,11 @@ class Coin:
     locked_until: int = 0
     candidate_confirmed_at: int | None = None
     candidate_hold_until: int = 0
+    live_visible: bool = False
+    live_first_seen_at: int | None = None
+    live_first_seen_price: float | None = None
+    live_peak_price: float | None = None
+    live_trough_price: float | None = None
 
 
 def pct(new: float, old: float) -> float:
@@ -252,11 +257,11 @@ def public_coin(coin: Coin, row: dict[str, float]) -> dict[str, Any]:
         "action": action,
         "score": coin.score,
         "current_price": price,
-        "first_seen_at": coin.first_seen_at,
-        "first_seen_price": coin.first_seen_price,
-        "return_since_first": round(pct(price, coin.first_seen_price), 3) if coin.first_seen_price else None,
-        "peak_return": round(pct(coin.peak_price, coin.first_seen_price), 3) if coin.first_seen_price and coin.peak_price else None,
-        "mae": round(pct(coin.trough_price, coin.first_seen_price), 3) if coin.first_seen_price and coin.trough_price else None,
+        "first_seen_at": coin.live_first_seen_at,
+        "first_seen_price": coin.live_first_seen_price,
+        "return_since_first": round(pct(price, coin.live_first_seen_price), 3) if coin.live_first_seen_price else None,
+        "peak_return": round(pct(coin.live_peak_price, coin.live_first_seen_price), 3) if coin.live_first_seen_price and coin.live_peak_price else None,
+        "mae": round(pct(coin.live_trough_price, coin.live_first_seen_price), 3) if coin.live_first_seen_price and coin.live_trough_price else None,
         "flow_30s": round(row.get("flow_30s", 0.0), 2),
         "flow_1m": round(row.get("flow_1m", 0.0), 2),
         "flow_3m": round(row.get("flow_3m", 0.0), 2),
@@ -280,14 +285,13 @@ def public_coin(coin: Coin, row: dict[str, float]) -> dict[str, Any]:
 
 
 def still_qualifies(row: dict[str, Any]) -> bool:
-    """Use the same displayed score and live inputs; remove a row immediately on failure."""
+    """Catch early flow quickly, but exclude weak selling, wide spreads, and overheated moves."""
     return (
-        int(row["score"]) >= 80
-        and int(row["trade_count_30s"]) >= 20
-        and float(row["buy_ratio_30s"]) >= 60.0
-        and float(row["buy_ratio_1m"]) >= 55.0
-        and float(row["orderbook_buy_ratio"]) >= 52.0
-        and 0.10 <= float(row["change_1m"]) < 5.0
+        int(row["score"]) >= 60
+        and int(row["trade_count_30s"]) >= 8
+        and float(row["buy_ratio_30s"]) >= 52.0
+        and float(row["buy_ratio_1m"]) >= 50.0
+        and -0.30 <= float(row["change_1m"]) < 5.0
         and float(row["change_30s"]) < 3.5
         and float(row["change_3m"]) < 10.0
         and float(row["spread"]) <= 0.8
@@ -450,30 +454,51 @@ class Scanner:
             delay = min(delay * 2, 30)
 
     def snapshot(self) -> dict[str, Any]:
-        rows = [public_coin(coin, self.latest.get(code, {})) for code, coin in self.coins.items() if code in self.latest]
+        now = int(time.time() * 1000)
         btc_row = self.latest.get("KRW-BTC", {})
         btc_falling = float(btc_row.get("change_3m", 0.0)) <= -0.35 or float(btc_row.get("change_1m", 0.0)) <= -0.20
-        rows = [
-            row for row in rows
-            if row["candidate_confirmed_at"]
-            and row["state"] == "상승 가능"
-            and row["confirmed_for_seconds"] >= 15
-            and still_qualifies(row)
-        ]
+        rows = []
+        for code, coin in self.coins.items():
+            if code not in self.latest:
+                continue
+            row = public_coin(coin, self.latest[code])
+            qualifies = still_qualifies(row)
+            price = float(row["current_price"] or 0.0)
+            if qualifies:
+                if not coin.live_visible:
+                    coin.live_visible = True
+                    coin.live_first_seen_at = now
+                    coin.live_first_seen_price = price
+                    coin.live_peak_price = price
+                    coin.live_trough_price = price
+                coin.live_peak_price = max(coin.live_peak_price or price, price)
+                coin.live_trough_price = min(coin.live_trough_price or price, price)
+                row = public_coin(coin, self.latest[code])
+                rows.append(row)
+            elif coin.live_visible:
+                coin.live_visible = False
+                coin.live_first_seen_at = None
+                coin.live_first_seen_price = None
+                coin.live_peak_price = None
+                coin.live_trough_price = None
         for row in rows:
-            row["action"] = "고위험 초입" if btc_falling else "초입 검토"
+            strong = int(row["score"]) >= 75 and float(row["buy_ratio_30s"]) >= 56.0
+            if strong:
+                row["action"] = "고위험 초입" if btc_falling else "초입 검토"
+            else:
+                row["action"] = "고위험 포착" if btc_falling else "수급 포착"
             row["risk"] = "BTC 단기 하락" if btc_falling else "일반"
             row["stop_price_3pct"] = round(float(row["first_seen_price"]) * 0.97, 8) if row.get("first_seen_price") else None
             prices = [float(point[1]) for point in row.get("chart_prices", [])]
             row["recent_low"] = round(min(prices), 8) if prices else None
         rows.sort(key=lambda row: (-row["score"], -(row["candidate_confirmed_at"] or 0)))
         return {
-            "engine": "BES Single Early Flow V1.0",
+            "engine": "BES Single Early Flow V1.1",
             "connected": self.connected,
             "updated_at_ms": self.updated_at,
             "market_count": len(self.coins),
             "candidate_count": len(rows),
-            "buy_review_count": sum(row["action"] == "초입 검토" for row in rows),
+            "buy_review_count": sum(int(row["score"]) >= 75 for row in rows),
             "btc_market": {"state": "단기 하락·고위험" if btc_falling else "보통", "blocking": False},
             "results": rows,
             "events": self.events[-100:],
