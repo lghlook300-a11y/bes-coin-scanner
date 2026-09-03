@@ -79,6 +79,17 @@ class Coin:
     live_peak_price: float | None = None
     live_trough_price: float | None = None
     live_weak_since: int | None = None
+    flow_stage: str = ""
+    flow_first_at: int | None = None
+    flow_first_price: float | None = None
+    flow_first_strength: float = 0.0
+    flow_second_at: int | None = None
+    flow_second_strength: float = 0.0
+    flow_peak_price: float | None = None
+    flow_trough_price: float | None = None
+    flow_invalidation_price: float | None = None
+    flow_hold_until: int = 0
+    flow_exit_reason: str = ""
 
 
 def pct(new: float, old: float) -> float:
@@ -105,6 +116,7 @@ def metrics(coin: Coin, now: int, seconds: int) -> dict[str, float]:
 
 
 def features(coin: Coin, now: int) -> dict[str, float]:
+    m10 = metrics(coin, now, 10)
     m30 = metrics(coin, now, 30)
     m60 = metrics(coin, now, 60)
     m180 = metrics(coin, now, 180)
@@ -113,6 +125,9 @@ def features(coin: Coin, now: int) -> dict[str, float]:
     price = coin.ticks[-1].price if coin.ticks else 0.0
     return {
         "price": price,
+        "trade_count_10s": m10["count"],
+        "flow_10s": m10["value"] / (baseline * 10.0),
+        "buy_10s": m10["buy_ratio"],
         "trade_count_30s": m30["count"],
         "flow_30s": m30["value"] / (baseline * 30.0),
         "flow_1m": m60["value"] / (baseline * 60.0),
@@ -310,6 +325,100 @@ def must_remove_now(row: dict[str, Any]) -> bool:
     )
 
 
+def reset_flow_sequence(coin: Coin) -> None:
+    coin.flow_stage = ""
+    coin.flow_first_at = None
+    coin.flow_first_price = None
+    coin.flow_first_strength = 0.0
+    coin.flow_second_at = None
+    coin.flow_second_strength = 0.0
+    coin.flow_peak_price = None
+    coin.flow_trough_price = None
+    coin.flow_invalidation_price = None
+    coin.flow_hold_until = 0
+    coin.flow_exit_reason = ""
+
+
+def flow_pulse(coin: Coin, row: dict[str, float]) -> bool:
+    return (
+        coin.score >= 60
+        and row["trade_count_10s"] >= 3
+        and row["flow_10s"] >= 1.0
+        and row["buy_10s"] >= 0.52
+        and row["trade_count_30s"] >= 8
+        and row["buy_30s"] >= 0.52
+        and row["buy_1m"] >= 0.50
+        and row["spread"] <= 0.8
+        and -0.30 <= row["change_1m"] < 5.0
+        and row["change_30s"] < 3.5
+        and row["change_3m"] < 10.0
+    )
+
+
+def update_flow_sequence(coin: Coin, row: dict[str, float], now: int) -> None:
+    price = float(row["price"])
+    if price <= 0:
+        return
+    pulse = flow_pulse(coin, row)
+    strong_sell = row["buy_30s"] < 0.43 and row["change_30s"] < -0.40
+
+    if coin.flow_stage == "탈락":
+        if now >= coin.flow_hold_until:
+            reset_flow_sequence(coin)
+        return
+
+    if coin.flow_stage in {"수급 2회 확인", "초입 검토"}:
+        coin.flow_peak_price = max(coin.flow_peak_price or price, price)
+        coin.flow_trough_price = min(coin.flow_trough_price or price, price)
+        stop_broken = bool(coin.flow_invalidation_price and price <= coin.flow_invalidation_price)
+        if stop_broken or strong_sell:
+            coin.flow_stage = "탈락"
+            coin.flow_exit_reason = "기준 저점·손절선 이탈" if stop_broken else "강한 매도 전환"
+            coin.flow_hold_until = now + 30_000
+            return
+        if coin.flow_stage == "수급 2회 확인" and coin.flow_second_at and now - coin.flow_second_at >= 5_000:
+            coin.flow_stage = "초입 검토"
+            coin.flow_hold_until = now + 180_000
+        elif coin.flow_stage == "초입 검토" and now >= coin.flow_hold_until:
+            reset_flow_sequence(coin)
+        return
+
+    if coin.flow_stage == "수급 1회":
+        coin.flow_peak_price = max(coin.flow_peak_price or price, price)
+        coin.flow_trough_price = min(coin.flow_trough_price or price, price)
+        if strong_sell or (coin.flow_first_price and price <= coin.flow_first_price * 0.97):
+            coin.flow_stage = "탈락"
+            coin.flow_exit_reason = "1차 포착 후 가격·수급 붕괴"
+            coin.flow_hold_until = now + 30_000
+            return
+        age = now - int(coin.flow_first_at or now)
+        if age > 90_000:
+            reset_flow_sequence(coin)
+            return
+        defended = bool(
+            coin.flow_first_price
+            and price >= coin.flow_first_price * 0.985
+            and (coin.flow_trough_price or price) >= coin.flow_first_price * 0.985
+        )
+        repeated = row["flow_10s"] >= max(1.0, coin.flow_first_strength * 0.50)
+        if 20_000 <= age <= 90_000 and pulse and repeated and defended:
+            coin.flow_stage = "수급 2회 확인"
+            coin.flow_second_at = now
+            coin.flow_second_strength = row["flow_10s"]
+            short_floor = float(coin.flow_trough_price or price) * 0.997
+            coin.flow_invalidation_price = max(coin.flow_first_price * 0.97, short_floor)
+            coin.flow_hold_until = now + 185_000
+        return
+
+    if pulse:
+        coin.flow_stage = "수급 1회"
+        coin.flow_first_at = now
+        coin.flow_first_price = price
+        coin.flow_first_strength = row["flow_10s"]
+        coin.flow_peak_price = price
+        coin.flow_trough_price = price
+
+
 class Scanner:
     def __init__(self) -> None:
         self.coins: dict[str, Coin] = {}
@@ -348,6 +457,9 @@ class Scanner:
             "state", "score", "first_seen_at", "first_seen_price", "peak_price", "trough_price",
             "last_change_at", "state_since", "pending_state", "pending_since", "locked_until",
             "candidate_confirmed_at", "candidate_hold_until",
+            "flow_stage", "flow_first_at", "flow_first_price", "flow_first_strength",
+            "flow_second_at", "flow_second_strength", "flow_peak_price", "flow_trough_price",
+            "flow_invalidation_price", "flow_hold_until", "flow_exit_reason",
         )
         for code, values in saved.items():
             coin = self.coins.get(code)
@@ -375,6 +487,17 @@ class Scanner:
                     "locked_until": coin.locked_until,
                     "candidate_confirmed_at": coin.candidate_confirmed_at,
                     "candidate_hold_until": coin.candidate_hold_until,
+                    "flow_stage": coin.flow_stage,
+                    "flow_first_at": coin.flow_first_at,
+                    "flow_first_price": coin.flow_first_price,
+                    "flow_first_strength": coin.flow_first_strength,
+                    "flow_second_at": coin.flow_second_at,
+                    "flow_second_strength": coin.flow_second_strength,
+                    "flow_peak_price": coin.flow_peak_price,
+                    "flow_trough_price": coin.flow_trough_price,
+                    "flow_invalidation_price": coin.flow_invalidation_price,
+                    "flow_hold_until": coin.flow_hold_until,
+                    "flow_exit_reason": coin.flow_exit_reason,
                 }
                 for code, coin in self.coins.items()
             }
@@ -427,6 +550,7 @@ class Scanner:
             self.percentiles = {code: index / denominator * 100.0 for index, code in enumerate(ranked)}
             for code in dirty:
                 event = classify(self.coins[code], self.latest[code], self.percentiles.get(code, 0.0), now)
+                update_flow_sequence(self.coins[code], self.latest[code], now)
                 if event:
                     self.events.append(event)
                     self.events = self.events[-500:]
@@ -466,63 +590,35 @@ class Scanner:
             delay = min(delay * 2, 30)
 
     def snapshot(self) -> dict[str, Any]:
-        now = int(time.time() * 1000)
         btc_row = self.latest.get("KRW-BTC", {})
         btc_falling = float(btc_row.get("change_3m", 0.0)) <= -0.35 or float(btc_row.get("change_1m", 0.0)) <= -0.20
         rows = []
         for code, coin in self.coins.items():
-            if code not in self.latest:
+            if code not in self.latest or not coin.flow_stage:
                 continue
             row = public_coin(coin, self.latest[code])
-            qualifies = still_qualifies(row)
-            price = float(row["current_price"] or 0.0)
-            if qualifies:
-                if not coin.live_visible:
-                    coin.live_visible = True
-                    coin.live_first_seen_at = now
-                    coin.live_first_seen_price = price
-                    coin.live_peak_price = price
-                    coin.live_trough_price = price
-                coin.live_weak_since = None
-                coin.live_peak_price = max(coin.live_peak_price or price, price)
-                coin.live_trough_price = min(coin.live_trough_price or price, price)
-                row = public_coin(coin, self.latest[code])
-                row["weakening"] = False
-                rows.append(row)
-            elif coin.live_visible:
-                if must_remove_now(row):
-                    coin.live_visible = False
-                else:
-                    coin.live_weak_since = coin.live_weak_since or now
-                    if now - coin.live_weak_since < 30_000:
-                        coin.live_peak_price = max(coin.live_peak_price or price, price)
-                        coin.live_trough_price = min(coin.live_trough_price or price, price)
-                        row = public_coin(coin, self.latest[code])
-                        row["weakening"] = True
-                        rows.append(row)
-                    else:
-                        coin.live_visible = False
-                if not coin.live_visible:
-                    coin.live_first_seen_at = None
-                    coin.live_first_seen_price = None
-                    coin.live_peak_price = None
-                    coin.live_trough_price = None
-                    coin.live_weak_since = None
-        for row in rows:
-            strong = int(row["score"]) >= 75 and float(row["buy_ratio_30s"]) >= 56.0
-            if row.get("weakening"):
-                row["action"] = "조건 약화"
-            elif strong:
-                row["action"] = "고위험 초입" if btc_falling else "초입 검토"
+            row["first_seen_at"] = coin.flow_first_at
+            row["first_seen_price"] = coin.flow_first_price
+            row["return_since_first"] = round(pct(float(row["current_price"]), coin.flow_first_price), 3) if coin.flow_first_price else None
+            row["peak_return"] = round(pct(coin.flow_peak_price, coin.flow_first_price), 3) if coin.flow_first_price and coin.flow_peak_price else None
+            row["mae"] = round(pct(coin.flow_trough_price, coin.flow_first_price), 3) if coin.flow_first_price and coin.flow_trough_price else None
+            row["flow_first_strength"] = round(coin.flow_first_strength, 2)
+            row["flow_second_strength"] = round(coin.flow_second_strength, 2) if coin.flow_second_at else None
+            row["invalidation_price"] = round(coin.flow_invalidation_price, 8) if coin.flow_invalidation_price else round(coin.flow_first_price * 0.97, 8) if coin.flow_first_price else None
+            row["exit_reason"] = coin.flow_exit_reason
+            if coin.flow_stage == "초입 검토" and btc_falling:
+                row["action"] = "고위험 초입"
             else:
-                row["action"] = "고위험 포착" if btc_falling else "수급 포착"
+                row["action"] = coin.flow_stage
             row["risk"] = "BTC 단기 하락" if btc_falling else "일반"
             row["stop_price_3pct"] = round(float(row["first_seen_price"]) * 0.97, 8) if row.get("first_seen_price") else None
             prices = [float(point[1]) for point in row.get("chart_prices", [])]
             row["recent_low"] = round(min(prices), 8) if prices else None
-        rows.sort(key=lambda row: (-row["score"], -(row["candidate_confirmed_at"] or 0)))
+            rows.append(row)
+        stage_order = {"초입 검토": 0, "고위험 초입": 0, "수급 2회 확인": 1, "수급 1회": 2, "탈락": 3}
+        rows.sort(key=lambda row: (stage_order.get(row["action"], 9), -row["score"], -(row["first_seen_at"] or 0)))
         return {
-            "engine": "BES Single Early Flow V1.2",
+            "engine": "BES Repeated Flow & Defense V2.0",
             "connected": self.connected,
             "updated_at_ms": self.updated_at,
             "market_count": len(self.coins),
