@@ -14,7 +14,6 @@ import uuid
 from typing import Any
 
 from aiohttp import ClientSession, WSMsgType, web
-import legacy_scanner
 
 
 REST_API = "https://api.bithumb.com/v1"
@@ -22,8 +21,6 @@ WS_API = "wss://ws-api.bithumb.com/websocket/v1"
 DATA_DIR = Path(os.environ.get("BES_DATA_DIR", "data-live"))
 STATE_FILE = DATA_DIR / "scanner_state.json"
 EVENT_FILE = DATA_DIR / "events.jsonl"
-LEGACY_FILE = DATA_DIR / "legacy_latest.json"
-LEGACY_WATCH_FILE = DATA_DIR / "legacy_watch_state.json"
 STATIC_DIR = Path(__file__).with_name("static")
 STABLE = {"USDT", "USDC", "DAI", "TUSD", "FDUSD", "USDE", "PYUSD"}
 STATE_CONFIRM_MS = {
@@ -243,7 +240,7 @@ def public_coin(coin: Coin, row: dict[str, float]) -> dict[str, Any]:
     if coin.state == "과열·추격 금지":
         action = "눌림 대기"
     elif coin.state == "상승 가능":
-        action = "매수 검토"
+        action = "초입 검토"
     elif coin.candidate_hold_until > now and coin.state != "수급 이탈":
         action = "관찰"
     else:
@@ -263,9 +260,11 @@ def public_coin(coin: Coin, row: dict[str, float]) -> dict[str, Any]:
         "flow_30s": round(row.get("flow_30s", 0.0), 2),
         "flow_1m": round(row.get("flow_1m", 0.0), 2),
         "flow_3m": round(row.get("flow_3m", 0.0), 2),
+        "trade_count_30s": int(row.get("trade_count_30s", 0.0)),
         "buy_ratio_30s": round(row.get("buy_30s", 0.5) * 100.0, 1),
         "buy_ratio_1m": round(row.get("buy_1m", 0.5) * 100.0, 1),
         "orderbook_buy_ratio": round(row.get("book_buy", 0.5) * 100.0, 1),
+        "spread": round(row.get("spread", 0.0), 3),
         "change_30s": round(row.get("change_30s", 0.0), 3),
         "change_1m": round(row.get("change_1m", 0.0), 3),
         "change_3m": round(row.get("change_3m", 0.0), 3),
@@ -278,6 +277,21 @@ def public_coin(coin: Coin, row: dict[str, float]) -> dict[str, Any]:
         "pending_for_seconds": max(0, int((time.time() * 1000 - coin.pending_since) / 1000)) if coin.pending_since else 0,
         "chart_prices": chart_prices(coin),
     }
+
+
+def still_qualifies(row: dict[str, Any]) -> bool:
+    """Use the same displayed score and live inputs; remove a row immediately on failure."""
+    return (
+        int(row["score"]) >= 80
+        and int(row["trade_count_30s"]) >= 20
+        and float(row["buy_ratio_30s"]) >= 60.0
+        and float(row["buy_ratio_1m"]) >= 55.0
+        and float(row["orderbook_buy_ratio"]) >= 52.0
+        and 0.10 <= float(row["change_1m"]) < 5.0
+        and float(row["change_30s"]) < 3.5
+        and float(row["change_3m"]) < 10.0
+        and float(row["spread"]) <= 0.8
+    )
 
 
 class Scanner:
@@ -436,69 +450,34 @@ class Scanner:
             delay = min(delay * 2, 30)
 
     def snapshot(self) -> dict[str, Any]:
-        now = int(time.time() * 1000)
         rows = [public_coin(coin, self.latest.get(code, {})) for code, coin in self.coins.items() if code in self.latest]
-        legacy = self.legacy_snapshot()
-        btc = legacy.get("btc_market") or {
-            "state": "데이터 부족·매수 금지",
-            "allows_entry": False,
-            "allows_strong_watch": False,
-        }
+        btc_row = self.latest.get("KRW-BTC", {})
+        btc_falling = float(btc_row.get("change_3m", 0.0)) <= -0.35 or float(btc_row.get("change_1m", 0.0)) <= -0.20
         rows = [
             row for row in rows
             if row["candidate_confirmed_at"]
             and row["state"] == "상승 가능"
-            and row["confirmed_for_seconds"] >= (15 if btc.get("allows_entry") else 20)
-            and row["score"] >= (80 if btc.get("allows_entry") else 90)
-            and btc.get("allows_strong_watch", False)
+            and row["confirmed_for_seconds"] >= 15
+            and still_qualifies(row)
         ]
         for row in rows:
-            row["action"] = "초입 검토" if btc.get("allows_entry") else "강한 관찰"
+            row["action"] = "고위험 초입" if btc_falling else "초입 검토"
+            row["risk"] = "BTC 단기 하락" if btc_falling else "일반"
+            row["stop_price_3pct"] = round(float(row["first_seen_price"]) * 0.97, 8) if row.get("first_seen_price") else None
+            prices = [float(point[1]) for point in row.get("chart_prices", [])]
+            row["recent_low"] = round(min(prices), 8) if prices else None
         rows.sort(key=lambda row: (-row["score"], -(row["candidate_confirmed_at"] or 0)))
-        top_rows = rows[:3]
         return {
-            "engine": "BES BTC-Gated Real-time V0.2",
+            "engine": "BES Single Early Flow V1.0",
             "connected": self.connected,
             "updated_at_ms": self.updated_at,
             "market_count": len(self.coins),
             "candidate_count": len(rows),
             "buy_review_count": sum(row["action"] == "초입 검토" for row in rows),
-            "btc_market": btc,
-            "results": top_rows,
+            "btc_market": {"state": "단기 하락·고위험" if btc_falling else "보통", "blocking": False},
+            "results": rows,
             "events": self.events[-100:],
         }
-
-    def legacy_snapshot(self) -> dict[str, Any]:
-        try:
-            return json.loads(LEGACY_FILE.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return {
-                "engine": "BES Momentum 15m",
-                "updated_at": None,
-                "market_count": len(self.coins),
-                "scanned_count": 0,
-                "active_count": 0,
-                "actionable_count": 0,
-                "candidates": [],
-                "status": "첫 15분 검사 진행 중",
-            }
-
-    async def legacy_scan_loop(self) -> None:
-        legacy_scanner.OUT = LEGACY_FILE
-        legacy_scanner.WATCH_STATE = LEGACY_WATCH_FILE
-        while True:
-            started = time.monotonic()
-            try:
-                await asyncio.to_thread(legacy_scanner.main)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                self.events.append({
-                    "timestamp_ms": int(time.time() * 1000),
-                    "state": "15분 검색 오류",
-                    "error": str(exc),
-                })
-            await asyncio.sleep(max(5.0, 900.0 - (time.monotonic() - started)))
 
 
 async def main() -> None:
@@ -507,13 +486,12 @@ async def main() -> None:
         await scanner.bootstrap(session)
         app = web.Application()
         app.router.add_get("/api/state", lambda _: web.json_response(scanner.snapshot()))
-        app.router.add_get("/api/legacy-state", lambda _: web.json_response(scanner.legacy_snapshot()))
         app.router.add_get("/health", lambda _: web.json_response({"ok": scanner.connected, "markets": len(scanner.coins)}))
         app.router.add_static("/", STATIC_DIR, show_index=True)
         runner = web.AppRunner(app)
         await runner.setup()
         await web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", "8080"))).start()
-        await asyncio.gather(scanner.stream(session), scanner.evaluate(), scanner.save_loop(), scanner.legacy_scan_loop())
+        await asyncio.gather(scanner.stream(session), scanner.evaluate(), scanner.save_loop())
 
 
 if __name__ == "__main__":
