@@ -78,6 +78,7 @@ class Coin:
     live_first_seen_price: float | None = None
     live_peak_price: float | None = None
     live_trough_price: float | None = None
+    live_weak_since: int | None = None
 
 
 def pct(new: float, old: float) -> float:
@@ -298,6 +299,17 @@ def still_qualifies(row: dict[str, Any]) -> bool:
     )
 
 
+def must_remove_now(row: dict[str, Any]) -> bool:
+    return (
+        int(row["score"]) < 45
+        or (float(row["buy_ratio_30s"]) < 43.0 and float(row["change_30s"]) < -0.40)
+        or float(row["change_30s"]) >= 3.5
+        or float(row["change_1m"]) >= 5.0
+        or float(row["change_3m"]) >= 10.0
+        or float(row["spread"]) > 0.8
+    )
+
+
 class Scanner:
     def __init__(self) -> None:
         self.coins: dict[str, Coin] = {}
@@ -471,19 +483,36 @@ class Scanner:
                     coin.live_first_seen_price = price
                     coin.live_peak_price = price
                     coin.live_trough_price = price
+                coin.live_weak_since = None
                 coin.live_peak_price = max(coin.live_peak_price or price, price)
                 coin.live_trough_price = min(coin.live_trough_price or price, price)
                 row = public_coin(coin, self.latest[code])
+                row["weakening"] = False
                 rows.append(row)
             elif coin.live_visible:
-                coin.live_visible = False
-                coin.live_first_seen_at = None
-                coin.live_first_seen_price = None
-                coin.live_peak_price = None
-                coin.live_trough_price = None
+                if must_remove_now(row):
+                    coin.live_visible = False
+                else:
+                    coin.live_weak_since = coin.live_weak_since or now
+                    if now - coin.live_weak_since < 30_000:
+                        coin.live_peak_price = max(coin.live_peak_price or price, price)
+                        coin.live_trough_price = min(coin.live_trough_price or price, price)
+                        row = public_coin(coin, self.latest[code])
+                        row["weakening"] = True
+                        rows.append(row)
+                    else:
+                        coin.live_visible = False
+                if not coin.live_visible:
+                    coin.live_first_seen_at = None
+                    coin.live_first_seen_price = None
+                    coin.live_peak_price = None
+                    coin.live_trough_price = None
+                    coin.live_weak_since = None
         for row in rows:
             strong = int(row["score"]) >= 75 and float(row["buy_ratio_30s"]) >= 56.0
-            if strong:
+            if row.get("weakening"):
+                row["action"] = "조건 약화"
+            elif strong:
                 row["action"] = "고위험 초입" if btc_falling else "초입 검토"
             else:
                 row["action"] = "고위험 포착" if btc_falling else "수급 포착"
@@ -493,12 +522,12 @@ class Scanner:
             row["recent_low"] = round(min(prices), 8) if prices else None
         rows.sort(key=lambda row: (-row["score"], -(row["candidate_confirmed_at"] or 0)))
         return {
-            "engine": "BES Single Early Flow V1.1",
+            "engine": "BES Single Early Flow V1.2",
             "connected": self.connected,
             "updated_at_ms": self.updated_at,
             "market_count": len(self.coins),
             "candidate_count": len(rows),
-            "buy_review_count": sum(int(row["score"]) >= 75 for row in rows),
+            "buy_review_count": sum(row["action"] in {"초입 검토", "고위험 초입"} for row in rows),
             "btc_market": {"state": "단기 하락·고위험" if btc_falling else "보통", "blocking": False},
             "results": rows,
             "events": self.events[-100:],
