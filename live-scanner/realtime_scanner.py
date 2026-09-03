@@ -438,22 +438,32 @@ class Scanner:
     def snapshot(self) -> dict[str, Any]:
         now = int(time.time() * 1000)
         rows = [public_coin(coin, self.latest.get(code, {})) for code, coin in self.coins.items() if code in self.latest]
-        action_order = {"매수 검토": 0, "관찰": 1, "눌림 대기": 2, "매수 금지": 3}
+        legacy = self.legacy_snapshot()
+        btc = legacy.get("btc_market") or {
+            "state": "데이터 부족·매수 금지",
+            "allows_entry": False,
+            "allows_strong_watch": False,
+        }
         rows = [
             row for row in rows
             if row["candidate_confirmed_at"]
-            and (row["state"] in {"수급 유입", "상승 가능"} or row["candidate_hold_until"] > now)
-            and row["state"] != "수급 이탈"
+            and row["state"] == "상승 가능"
+            and row["confirmed_for_seconds"] >= (15 if btc.get("allows_entry") else 20)
+            and row["score"] >= (80 if btc.get("allows_entry") else 90)
+            and btc.get("allows_strong_watch", False)
         ]
-        rows.sort(key=lambda row: (action_order[row["action"]], -row["score"], -(row["candidate_confirmed_at"] or 0)))
+        for row in rows:
+            row["action"] = "초입 검토" if btc.get("allows_entry") else "강한 관찰"
+        rows.sort(key=lambda row: (-row["score"], -(row["candidate_confirmed_at"] or 0)))
         top_rows = rows[:3]
         return {
-            "engine": "BES Real-time Confirmed TOP 3 V1.2",
+            "engine": "BES BTC-Gated Real-time V0.2",
             "connected": self.connected,
             "updated_at_ms": self.updated_at,
             "market_count": len(self.coins),
             "candidate_count": len(rows),
-            "buy_review_count": sum(row["action"] == "매수 검토" for row in rows),
+            "buy_review_count": sum(row["action"] == "초입 검토" for row in rows),
+            "btc_market": btc,
             "results": top_rows,
             "events": self.events[-100:],
         }
