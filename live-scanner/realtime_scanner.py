@@ -21,6 +21,7 @@ WS_API = "wss://ws-api.bithumb.com/websocket/v1"
 DATA_DIR = Path(os.environ.get("BES_DATA_DIR", "data-live"))
 STATE_FILE = DATA_DIR / "scanner_state.json"
 EVENT_FILE = DATA_DIR / "events.jsonl"
+PERFORMANCE_FILE = DATA_DIR / "flow_performance.json"
 STATIC_DIR = Path(__file__).with_name("static")
 STABLE = {"USDT", "USDC", "DAI", "TUSD", "FDUSD", "USDE", "PYUSD"}
 STATE_CONFIRM_MS = {
@@ -90,6 +91,7 @@ class Coin:
     flow_invalidation_price: float | None = None
     flow_hold_until: int = 0
     flow_exit_reason: str = ""
+    flow_cooldown_until: int = 0
 
 
 def pct(new: float, old: float) -> float:
@@ -351,11 +353,11 @@ def flow_pulse(coin: Coin, row: dict[str, float]) -> bool:
         and row["spread"] <= 0.8
         and -0.30 <= row["change_1m"] < 5.0
         and row["change_30s"] < 3.5
-        and row["change_3m"] < 10.0
+        and row["change_3m"] < 6.0
     )
 
 
-def update_flow_sequence(coin: Coin, row: dict[str, float], now: int) -> None:
+def update_flow_sequence(coin: Coin, row: dict[str, float], now: int, btc_falling: bool = False) -> None:
     price = float(row["price"])
     if price <= 0:
         return
@@ -375,6 +377,7 @@ def update_flow_sequence(coin: Coin, row: dict[str, float], now: int) -> None:
             coin.flow_stage = "탈락"
             coin.flow_exit_reason = "기준 저점·손절선 이탈" if stop_broken else "강한 매도 전환"
             coin.flow_hold_until = now + 30_000
+            coin.flow_cooldown_until = now + 30 * 60_000
             return
         if coin.flow_stage == "수급 2회 확인" and coin.flow_second_at and now - coin.flow_second_at >= 5_000:
             coin.flow_stage = "초입 검토"
@@ -390,18 +393,16 @@ def update_flow_sequence(coin: Coin, row: dict[str, float], now: int) -> None:
             coin.flow_stage = "탈락"
             coin.flow_exit_reason = "1차 포착 후 가격·수급 붕괴"
             coin.flow_hold_until = now + 30_000
+            coin.flow_cooldown_until = now + 30 * 60_000
             return
         age = now - int(coin.flow_first_at or now)
         if age > 90_000:
             reset_flow_sequence(coin)
             return
-        defended = bool(
-            coin.flow_first_price
-            and price >= coin.flow_first_price * 0.985
-            and (coin.flow_trough_price or price) >= coin.flow_first_price * 0.985
-        )
-        repeated = row["flow_10s"] >= max(1.0, coin.flow_first_strength * 0.50)
-        if 20_000 <= age <= 90_000 and pulse and repeated and defended:
+        defended = bool(coin.flow_first_price and price >= coin.flow_first_price)
+        required_ratio = 1.0 if btc_falling else 0.80
+        repeated = row["flow_10s"] >= max(1.0, coin.flow_first_strength * required_ratio)
+        if 20_000 <= age <= 90_000 and pulse and row["buy_10s"] >= 0.56 and repeated and defended:
             coin.flow_stage = "수급 2회 확인"
             coin.flow_second_at = now
             coin.flow_second_strength = row["flow_10s"]
@@ -410,7 +411,7 @@ def update_flow_sequence(coin: Coin, row: dict[str, float], now: int) -> None:
             coin.flow_hold_until = now + 185_000
         return
 
-    if pulse:
+    if pulse and now >= coin.flow_cooldown_until:
         coin.flow_stage = "수급 1회"
         coin.flow_first_at = now
         coin.flow_first_price = price
@@ -428,6 +429,61 @@ class Scanner:
         self.events: list[dict[str, Any]] = []
         self.connected = False
         self.updated_at = 0
+        self.performance_records = self.load_performance()
+
+    def load_performance(self) -> list[dict[str, Any]]:
+        try:
+            rows = json.loads(PERFORMANCE_FILE.read_text(encoding="utf-8"))
+            return rows if isinstance(rows, list) else []
+        except (OSError, ValueError):
+            return []
+
+    def record_flow_transition(self, coin: Coin, previous: str, previous_first_at: int | None,
+                               row: dict[str, float], now: int) -> None:
+        signal_id = f"{coin.market}-{coin.flow_first_at or previous_first_at}"
+        record = next((row for row in reversed(self.performance_records) if row.get("signal_id") == signal_id), None)
+        if coin.flow_stage == "수급 1회" and record is None:
+            self.performance_records.append({
+                "signal_id": signal_id, "market": coin.market, "symbol": coin.market.split("-", 1)[1],
+                "first_at_ms": coin.flow_first_at, "first_price": coin.flow_first_price,
+                "first_flow": round(coin.flow_first_strength, 4), "status": "1차 포착",
+                "peak_return": 0.0, "mae": 0.0, "snapshots": {},
+            })
+            return
+        if record is None:
+            return
+        if coin.flow_stage == "수급 2회 확인":
+            record.update({"second_at_ms": coin.flow_second_at, "second_price": float(row["price"]),
+                           "second_flow": round(coin.flow_second_strength, 4), "status": "2회 확인",
+                           "invalidation_price": coin.flow_invalidation_price})
+        elif coin.flow_stage == "초입 검토":
+            record.update({"confirmed_at_ms": now, "status": "진행 중"})
+        elif coin.flow_stage == "탈락":
+            record.update({"exited_at_ms": now, "status": "탈락", "exit_reason": coin.flow_exit_reason})
+        elif not coin.flow_stage and previous == "수급 1회":
+            record.update({"ended_at_ms": now, "status": "2회 미확인"})
+
+    def update_flow_performance(self, coin: Coin, row: dict[str, float], now: int) -> None:
+        records = [item for item in self.performance_records
+                   if item.get("market") == coin.market and item.get("first_at_ms")
+                   and now - int(item["first_at_ms"]) <= 181 * 60_000]
+        for record in records:
+            if not record.get("first_price"):
+                continue
+            ret = pct(float(row["price"]), float(record["first_price"]))
+            record["current_return"] = round(ret, 4)
+            record["peak_return"] = round(max(float(record.get("peak_return", 0.0)), ret), 4)
+            record["mae"] = round(min(float(record.get("mae", 0.0)), ret), 4)
+            for target, key in ((5.0, "hit_5_at_ms"), (10.0, "hit_10_at_ms")):
+                if ret >= target and not record.get(key):
+                    record[key] = now
+            age = now - int(record["first_at_ms"])
+            snapshots = record.setdefault("snapshots", {})
+            for limit, key in ((30 * 60_000, "30m"), (60 * 60_000, "1h"), (180 * 60_000, "3h")):
+                if age >= limit and key not in snapshots:
+                    snapshots[key] = round(ret, 4)
+            if age >= 180 * 60_000 and record["status"] not in {"탈락", "2회 미확인"}:
+                record["status"] = "3시간 완료"
 
     async def bootstrap(self, session: ClientSession) -> None:
         async with session.get(f"{REST_API}/market/all", params={"isDetails": "true"}) as response:
@@ -460,6 +516,7 @@ class Scanner:
             "flow_stage", "flow_first_at", "flow_first_price", "flow_first_strength",
             "flow_second_at", "flow_second_strength", "flow_peak_price", "flow_trough_price",
             "flow_invalidation_price", "flow_hold_until", "flow_exit_reason",
+            "flow_cooldown_until",
         )
         for code, values in saved.items():
             coin = self.coins.get(code)
@@ -498,12 +555,16 @@ class Scanner:
                     "flow_invalidation_price": coin.flow_invalidation_price,
                     "flow_hold_until": coin.flow_hold_until,
                     "flow_exit_reason": coin.flow_exit_reason,
+                    "flow_cooldown_until": coin.flow_cooldown_until,
                 }
                 for code, coin in self.coins.items()
             }
             temporary = STATE_FILE.with_suffix(".tmp")
             temporary.write_text(json.dumps({"coins": saved}, ensure_ascii=False), encoding="utf-8")
             temporary.replace(STATE_FILE)
+            performance_tmp = PERFORMANCE_FILE.with_suffix(".tmp")
+            performance_tmp.write_text(json.dumps(self.performance_records[-2000:], ensure_ascii=False), encoding="utf-8")
+            performance_tmp.replace(PERFORMANCE_FILE)
 
     def receive(self, payload: dict[str, Any]) -> None:
         code = str(payload.get("code", ""))
@@ -549,8 +610,16 @@ class Scanner:
             denominator = max(1, len(ranked) - 1)
             self.percentiles = {code: index / denominator * 100.0 for index, code in enumerate(ranked)}
             for code in dirty:
-                event = classify(self.coins[code], self.latest[code], self.percentiles.get(code, 0.0), now)
-                update_flow_sequence(self.coins[code], self.latest[code], now)
+                coin = self.coins[code]
+                event = classify(coin, self.latest[code], self.percentiles.get(code, 0.0), now)
+                previous_flow_stage = coin.flow_stage
+                previous_first_at = coin.flow_first_at
+                btc_row = self.latest.get("KRW-BTC", {})
+                btc_falling = float(btc_row.get("change_3m", 0.0)) <= -0.35 or float(btc_row.get("change_1m", 0.0)) <= -0.20
+                update_flow_sequence(coin, self.latest[code], now, btc_falling)
+                if coin.flow_stage != previous_flow_stage:
+                    self.record_flow_transition(coin, previous_flow_stage, previous_first_at, self.latest[code], now)
+                self.update_flow_performance(coin, self.latest[code], now)
                 if event:
                     self.events.append(event)
                     self.events = self.events[-500:]
@@ -618,7 +687,7 @@ class Scanner:
         stage_order = {"초입 검토": 0, "고위험 초입": 0, "수급 2회 확인": 1, "수급 1회": 2, "탈락": 3}
         rows.sort(key=lambda row: (stage_order.get(row["action"], 9), -row["score"], -(row["first_seen_at"] or 0)))
         return {
-            "engine": "BES Repeated Flow & Defense V2.0",
+            "engine": "BES Repeated Flow & Defense V2.1",
             "connected": self.connected,
             "updated_at_ms": self.updated_at,
             "market_count": len(self.coins),
@@ -627,6 +696,7 @@ class Scanner:
             "btc_market": {"state": "단기 하락·고위험" if btc_falling else "보통", "blocking": False},
             "results": rows,
             "events": self.events[-100:],
+            "performance_records": self.performance_records[-200:],
         }
 
 
@@ -636,6 +706,10 @@ async def main() -> None:
         await scanner.bootstrap(session)
         app = web.Application()
         app.router.add_get("/api/state", lambda _: web.json_response(scanner.snapshot()))
+        app.router.add_get("/api/performance", lambda _: web.json_response({
+            "engine": "BES Repeated Flow & Defense V2.1",
+            "records": scanner.performance_records[-2000:],
+        }))
         app.router.add_get("/health", lambda _: web.json_response({"ok": scanner.connected, "markets": len(scanner.coins)}))
         app.router.add_static("/", STATIC_DIR, show_index=True)
         runner = web.AppRunner(app)
