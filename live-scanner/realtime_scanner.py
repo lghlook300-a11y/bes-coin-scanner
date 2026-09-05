@@ -92,6 +92,8 @@ class Coin:
     flow_hold_until: int = 0
     flow_exit_reason: str = ""
     flow_cooldown_until: int = 0
+    decision_action: str = ""
+    decision_changed_at: int = 0
 
 
 def pct(new: float, old: float) -> float:
@@ -257,22 +259,74 @@ def chart_prices(coin: Coin) -> list[list[float | int]]:
     return [[tick.ts, round(tick.price, 8)] for tick in buckets.values()]
 
 
+def trade_decision(coin: Coin, row: dict[str, float], btc_falling: bool = False) -> dict[str, Any]:
+    """Turn a detected flow sequence into one clear, continuously refreshed action."""
+    price = float(row.get("price", 0.0))
+    first = float(coin.flow_first_price or 0.0)
+    invalidation = float(coin.flow_invalidation_price or (first * 0.97 if first else 0.0))
+    signal_return = pct(price, first) if first else 0.0
+    stop_distance = abs(pct(invalidation, price)) if price and invalidation else 99.0
+    latest_ts = coin.ticks[-1].ts if coin.ticks else 0
+    prior_prices = [
+        tick.price for tick in coin.ticks
+        if (not coin.flow_first_at or tick.ts >= coin.flow_first_at) and tick.ts <= latest_ts - 10_000
+    ]
+    short_resistance = max(prior_prices) if prior_prices else first
+    overheated = signal_return >= 6.0 or row.get("change_3m", 0.0) >= 6.0 or row.get("change_1m", 0.0) >= 4.0
+    strong_sell = row.get("buy_30s", 0.5) < 0.45 or (
+        row.get("buy_1m", 0.5) < 0.48 and row.get("change_30s", 0.0) < -0.25
+    )
+    broken = bool(invalidation and price <= invalidation)
+
+    if coin.flow_stage == "탈락" or broken:
+        action, reason = "매수 금지", coin.flow_exit_reason or "무효화 가격 이탈"
+    elif overheated:
+        action, reason = "매수 금지", "이미 단기 급등·추격 금지"
+    elif strong_sell:
+        action, reason = "매수 금지", "현재 매도 우세·수급 약화"
+    elif coin.flow_stage == "수급 1회":
+        action, reason = "기다림", "1차 포착만 확인·2차 수급 대기"
+    else:
+        repeated = coin.flow_stage in {"수급 2회 확인", "초입 검토"}
+        defended = bool(first and price >= first * 0.995)
+        flow_alive = row.get("buy_30s", 0.5) >= 0.52 and row.get("buy_1m", 0.5) >= 0.50 and row.get("flow_30s", 0.0) >= 1.0
+        breakout = (
+            repeated and defended and flow_alive and short_resistance > 0
+            and price >= short_resistance * 1.001
+            and row.get("buy_30s", 0.5) >= 0.58 and row.get("buy_1m", 0.5) >= 0.54
+            and row.get("change_1m", 0.0) >= 0.05
+        )
+        small_try = repeated and defended and flow_alive and stop_distance <= 3.2
+        if breakout:
+            action, reason = "돌파 확인", "2차 수급·가격 방어·상승 지속"
+        elif small_try:
+            action, reason = "소액 시도 가능", "2차 수급·최초 포착가 방어"
+        else:
+            action, reason = "기다림", "가격 방어 또는 현재 수급 재확인 필요"
+
+    if btc_falling and action in {"소액 시도 가능", "돌파 확인"}:
+        reason += " · BTC 약세이므로 비중 축소"
+    entry_low = first * 0.995 if first else None
+    entry_high = first * 1.01 if first else None
+    return {
+        "action": action,
+        "decision_reason": reason,
+        "entry_low": round(entry_low, 8) if entry_low else None,
+        "entry_high": round(entry_high, 8) if entry_high else None,
+        "decision_stop_price": round(invalidation, 8) if invalidation else None,
+        "breakout_price": round(short_resistance, 8) if short_resistance else None,
+        "stop_distance_percent": round(stop_distance, 2) if stop_distance < 99 else None,
+        "chase": overheated,
+    }
+
+
 def public_coin(coin: Coin, row: dict[str, float]) -> dict[str, Any]:
     price = row.get("price", 0.0)
-    now = int(time.time() * 1000)
-    if coin.state == "과열·추격 금지":
-        action = "눌림 대기"
-    elif coin.state == "상승 가능":
-        action = "초입 검토"
-    elif coin.candidate_hold_until > now and coin.state != "수급 이탈":
-        action = "관찰"
-    else:
-        action = "매수 금지"
     return {
         "market": coin.market,
         "symbol": coin.market.split("-", 1)[1],
         "state": coin.state,
-        "action": action,
+        "action": "기다림",
         "score": coin.score,
         "current_price": price,
         "first_seen_at": coin.live_first_seen_at,
@@ -485,6 +539,27 @@ class Scanner:
             if age >= 180 * 60_000 and record["status"] not in {"탈락", "2회 미확인"}:
                 record["status"] = "3시간 완료"
 
+    def record_decision(self, coin: Coin, row: dict[str, float], now: int, btc_falling: bool) -> None:
+        decision = trade_decision(coin, row, btc_falling)
+        action = str(decision["action"])
+        if action == coin.decision_action:
+            return
+        coin.decision_action = action
+        coin.decision_changed_at = now
+        signal_id = f"{coin.market}-{coin.flow_first_at}"
+        record = next((item for item in reversed(self.performance_records)
+                       if item.get("signal_id") == signal_id), None)
+        if record is None:
+            return
+        event = {"at_ms": now, "action": action, "price": float(row["price"]),
+                 "reason": decision["decision_reason"]}
+        record.setdefault("decision_events", []).append(event)
+        record["current_action"] = action
+        if action in {"소액 시도 가능", "돌파 확인"} and not record.get("first_actionable_at_ms"):
+            record["first_actionable_at_ms"] = now
+            record["first_actionable_price"] = float(row["price"])
+            record["first_actionable_type"] = action
+
     async def bootstrap(self, session: ClientSession) -> None:
         async with session.get(f"{REST_API}/market/all", params={"isDetails": "true"}) as response:
             markets = await response.json()
@@ -517,6 +592,7 @@ class Scanner:
             "flow_second_at", "flow_second_strength", "flow_peak_price", "flow_trough_price",
             "flow_invalidation_price", "flow_hold_until", "flow_exit_reason",
             "flow_cooldown_until",
+            "decision_action", "decision_changed_at",
         )
         for code, values in saved.items():
             coin = self.coins.get(code)
@@ -556,6 +632,8 @@ class Scanner:
                     "flow_hold_until": coin.flow_hold_until,
                     "flow_exit_reason": coin.flow_exit_reason,
                     "flow_cooldown_until": coin.flow_cooldown_until,
+                    "decision_action": coin.decision_action,
+                    "decision_changed_at": coin.decision_changed_at,
                 }
                 for code, coin in self.coins.items()
             }
@@ -620,6 +698,7 @@ class Scanner:
                 if coin.flow_stage != previous_flow_stage:
                     self.record_flow_transition(coin, previous_flow_stage, previous_first_at, self.latest[code], now)
                 self.update_flow_performance(coin, self.latest[code], now)
+                self.record_decision(coin, self.latest[code], now, btc_falling)
                 if event:
                     self.events.append(event)
                     self.events = self.events[-500:]
@@ -675,24 +754,21 @@ class Scanner:
             row["flow_second_strength"] = round(coin.flow_second_strength, 2) if coin.flow_second_at else None
             row["invalidation_price"] = round(coin.flow_invalidation_price, 8) if coin.flow_invalidation_price else round(coin.flow_first_price * 0.97, 8) if coin.flow_first_price else None
             row["exit_reason"] = coin.flow_exit_reason
-            if coin.flow_stage == "초입 검토" and btc_falling:
-                row["action"] = "고위험 초입"
-            else:
-                row["action"] = coin.flow_stage
+            row.update(trade_decision(coin, self.latest[code], btc_falling))
             row["risk"] = "BTC 단기 하락" if btc_falling else "일반"
             row["stop_price_3pct"] = round(float(row["first_seen_price"]) * 0.97, 8) if row.get("first_seen_price") else None
             prices = [float(point[1]) for point in row.get("chart_prices", [])]
             row["recent_low"] = round(min(prices), 8) if prices else None
             rows.append(row)
-        stage_order = {"초입 검토": 0, "고위험 초입": 0, "수급 2회 확인": 1, "수급 1회": 2, "탈락": 3}
+        stage_order = {"돌파 확인": 0, "소액 시도 가능": 1, "기다림": 2, "매수 금지": 3}
         rows.sort(key=lambda row: (stage_order.get(row["action"], 9), -row["score"], -(row["first_seen_at"] or 0)))
         return {
-            "engine": "BES Repeated Flow & Defense V2.1",
+            "engine": "BES Flow Decision V2.2",
             "connected": self.connected,
             "updated_at_ms": self.updated_at,
             "market_count": len(self.coins),
             "candidate_count": len(rows),
-            "buy_review_count": sum(row["action"] in {"초입 검토", "고위험 초입"} for row in rows),
+            "buy_review_count": sum(row["action"] in {"소액 시도 가능", "돌파 확인"} for row in rows),
             "btc_market": {"state": "단기 하락·고위험" if btc_falling else "보통", "blocking": False},
             "results": rows,
             "events": self.events[-100:],
@@ -707,7 +783,7 @@ async def main() -> None:
         app = web.Application()
         app.router.add_get("/api/state", lambda _: web.json_response(scanner.snapshot()))
         app.router.add_get("/api/performance", lambda _: web.json_response({
-            "engine": "BES Repeated Flow & Defense V2.1",
+            "engine": "BES Flow Decision V2.2",
             "records": scanner.performance_records[-2000:],
         }))
         app.router.add_get("/health", lambda _: web.json_response({"ok": scanner.connected, "markets": len(scanner.coins)}))
