@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
@@ -22,6 +23,7 @@ DATA_DIR = Path(os.environ.get("BES_DATA_DIR", "data-live"))
 STATE_FILE = DATA_DIR / "scanner_state.json"
 EVENT_FILE = DATA_DIR / "events.jsonl"
 PERFORMANCE_FILE = DATA_DIR / "flow_performance.json"
+DAILY_COUNT_FILE = DATA_DIR / "daily_detection_counts.json"
 STATIC_DIR = Path(__file__).with_name("static")
 STABLE = {"USDT", "USDC", "DAI", "TUSD", "FDUSD", "USDE", "PYUSD"}
 STATE_CONFIRM_MS = {
@@ -38,6 +40,7 @@ CHART_WINDOW_MS = 3 * 60_000
 CHART_BUCKET_MS = 5_000
 CANDIDATE_HOLD_MS = 3 * 60_000
 A_CONTEXT_REFRESH_MS = 5 * 60_000
+REDETECTION_GAP_MS = 30 * 60_000
 STATE_STRENGTH = {"일반 감시": 0, "관찰 유지": 1, "수급 유입": 2, "상승 가능": 3}
 
 
@@ -93,6 +96,7 @@ class Coin:
     flow_hold_until: int = 0
     flow_exit_reason: str = ""
     flow_cooldown_until: int = 0
+    last_sequence_ended_at: int = 0
     decision_action: str = ""
     decision_changed_at: int = 0
     a_checked_at: int = 0
@@ -109,6 +113,13 @@ def pct(new: float, old: float) -> float:
 
 def clip(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
+
+
+KST = timezone(timedelta(hours=9))
+
+
+def kst_date(timestamp_ms: int) -> str:
+    return datetime.fromtimestamp(timestamp_ms / 1000, KST).strftime("%Y-%m-%d")
 
 
 def ema(values: list[float], length: int) -> float:
@@ -442,7 +453,9 @@ def must_remove_now(row: dict[str, Any]) -> bool:
     )
 
 
-def reset_flow_sequence(coin: Coin) -> None:
+def reset_flow_sequence(coin: Coin, ended_at: int | None = None) -> None:
+    if ended_at is not None:
+        coin.last_sequence_ended_at = ended_at
     coin.flow_stage = ""
     coin.flow_first_at = None
     coin.flow_first_price = None
@@ -481,7 +494,7 @@ def update_flow_sequence(coin: Coin, row: dict[str, float], now: int, btc_fallin
 
     if coin.flow_stage == "탈락":
         if now >= coin.flow_hold_until:
-            reset_flow_sequence(coin)
+            reset_flow_sequence(coin, now)
         return
 
     if coin.flow_stage in {"수급 2회 확인", "초입 검토"}:
@@ -498,7 +511,7 @@ def update_flow_sequence(coin: Coin, row: dict[str, float], now: int, btc_fallin
             coin.flow_stage = "초입 검토"
             coin.flow_hold_until = now + 180_000
         elif coin.flow_stage == "초입 검토" and now >= coin.flow_hold_until:
-            reset_flow_sequence(coin)
+            reset_flow_sequence(coin, now)
         return
 
     if coin.flow_stage == "수급 1회":
@@ -512,7 +525,7 @@ def update_flow_sequence(coin: Coin, row: dict[str, float], now: int, btc_fallin
             return
         age = now - int(coin.flow_first_at or now)
         if age > 90_000:
-            reset_flow_sequence(coin)
+            reset_flow_sequence(coin, now)
             return
         defended = bool(coin.flow_first_price and price >= coin.flow_first_price)
         required_ratio = 1.0 if btc_falling else 0.80
@@ -545,8 +558,78 @@ class Scanner:
         self.connected = False
         self.updated_at = 0
         self.performance_records = self.load_performance()
+        self.daily_counts = self.load_daily_counts()
         self.session: ClientSession | None = None
         self.a_refreshing: set[str] = set()
+
+    def load_daily_counts(self) -> dict[str, dict[str, dict[str, Any]]]:
+        try:
+            rows = json.loads(DAILY_COUNT_FILE.read_text(encoding="utf-8"))
+            return rows if isinstance(rows, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def daily_row(self, coin: Coin, now: int) -> dict[str, Any]:
+        day = self.daily_counts.setdefault(kst_date(now), {})
+        return day.setdefault(coin.market, {
+            "symbol": coin.market.split("-", 1)[1], "total_count": 0, "a_count": 0,
+            "second_count": 0, "actionable_count": 0, "last_counted_at_ms": 0,
+            "last_seen_at_ms": 0, "prices": [], "counted_signal_ids": [],
+            "a_signal_ids": [], "second_signal_ids": [], "actionable_signal_ids": [],
+        })
+
+    def count_new_detection(self, coin: Coin, now: int, price: float) -> None:
+        row = self.daily_row(coin, now)
+        row["last_seen_at_ms"] = now
+        last = int(row.get("last_counted_at_ms", 0))
+        if last and now - last < REDETECTION_GAP_MS:
+            return
+        if coin.last_sequence_ended_at and now - coin.last_sequence_ended_at < REDETECTION_GAP_MS:
+            return
+        signal_id = f"{coin.market}-{coin.flow_first_at}"
+        row["total_count"] = int(row.get("total_count", 0)) + 1
+        row["last_counted_at_ms"] = now
+        row.setdefault("prices", []).append(round(price, 8))
+        row["prices"] = row["prices"][-48:]
+        row.setdefault("counted_signal_ids", []).append(signal_id)
+        row["counted_signal_ids"] = row["counted_signal_ids"][-48:]
+
+    def count_stage_once(self, coin: Coin, now: int, kind: str) -> None:
+        row = self.daily_row(coin, now)
+        signal_id = f"{coin.market}-{coin.flow_first_at}"
+        if signal_id not in row.get("counted_signal_ids", []):
+            return
+        key, ids_key = {
+            "a": ("a_count", "a_signal_ids"),
+            "second": ("second_count", "second_signal_ids"),
+            "actionable": ("actionable_count", "actionable_signal_ids"),
+        }[kind]
+        ids = row.setdefault(ids_key, [])
+        if signal_id in ids:
+            return
+        ids.append(signal_id)
+        row[key] = int(row.get(key, 0)) + 1
+
+    def public_daily_count(self, coin: Coin, now: int) -> dict[str, Any]:
+        row = self.daily_row(coin, now)
+        prices = [float(value) for value in row.get("prices", [])]
+        if len(prices) < 2:
+            trend = "비교 전"
+        elif prices[-1] > prices[0] * 1.003:
+            trend = "포착가 상승형"
+        elif prices[-1] < prices[0] * 0.997:
+            trend = "포착가 하락형"
+        else:
+            trend = "포착가 보합형"
+        return {
+            "daily_detection_count": int(row.get("total_count", 0)),
+            "daily_a_count": int(row.get("a_count", 0)),
+            "daily_second_count": int(row.get("second_count", 0)),
+            "daily_actionable_count": int(row.get("actionable_count", 0)),
+            "daily_last_seen_at_ms": int(row.get("last_seen_at_ms", 0)),
+            "daily_price_trend": trend,
+            "daily_detection_prices": prices,
+        }
 
     async def refresh_a_context(self, coin: Coin) -> None:
         now = int(time.time() * 1000)
@@ -575,6 +658,8 @@ class Scanner:
                 record["a_price"] = coin.a_price
                 record["a_distance_percent"] = coin.a_distance_percent
                 record["a_reason"] = coin.a_reason
+            if coin.a_near:
+                self.count_stage_once(coin, now, "a")
         except Exception as exc:
             coin.a_checked_at = now
             coin.a_reason = f"4시간봉 조회 실패: {type(exc).__name__}"
@@ -593,6 +678,7 @@ class Scanner:
         signal_id = f"{coin.market}-{coin.flow_first_at or previous_first_at}"
         record = next((row for row in reversed(self.performance_records) if row.get("signal_id") == signal_id), None)
         if coin.flow_stage == "수급 1회" and record is None:
+            self.count_new_detection(coin, now, float(row["price"]))
             self.performance_records.append({
                 "signal_id": signal_id, "market": coin.market, "symbol": coin.market.split("-", 1)[1],
                 "first_at_ms": coin.flow_first_at, "first_price": coin.flow_first_price,
@@ -606,6 +692,7 @@ class Scanner:
         if record is None:
             return
         if coin.flow_stage == "수급 2회 확인":
+            self.count_stage_once(coin, now, "second")
             record.update({"second_at_ms": coin.flow_second_at, "second_price": float(row["price"]),
                            "second_flow": round(coin.flow_second_strength, 4), "status": "2회 확인",
                            "invalidation_price": coin.flow_invalidation_price})
@@ -662,6 +749,8 @@ class Scanner:
             record["first_actionable_at_ms"] = now
             record["first_actionable_price"] = float(row["price"])
             record["first_actionable_type"] = action
+        if action in {"소액 시도 가능", "돌파 확인"}:
+            self.count_stage_once(coin, now, "actionable")
 
     async def bootstrap(self, session: ClientSession) -> None:
         self.session = session
@@ -696,6 +785,7 @@ class Scanner:
             "flow_second_at", "flow_second_strength", "flow_peak_price", "flow_trough_price",
             "flow_invalidation_price", "flow_hold_until", "flow_exit_reason",
             "flow_cooldown_until",
+            "last_sequence_ended_at",
             "decision_action", "decision_changed_at",
             "a_checked_at", "a_near", "a_price", "a_distance_percent", "a_defended", "a_reason",
         )
@@ -737,6 +827,7 @@ class Scanner:
                     "flow_hold_until": coin.flow_hold_until,
                     "flow_exit_reason": coin.flow_exit_reason,
                     "flow_cooldown_until": coin.flow_cooldown_until,
+                    "last_sequence_ended_at": coin.last_sequence_ended_at,
                     "decision_action": coin.decision_action,
                     "decision_changed_at": coin.decision_changed_at,
                     "a_checked_at": coin.a_checked_at,
@@ -754,6 +845,12 @@ class Scanner:
             performance_tmp = PERFORMANCE_FILE.with_suffix(".tmp")
             performance_tmp.write_text(json.dumps(self.performance_records[-2000:], ensure_ascii=False), encoding="utf-8")
             performance_tmp.replace(PERFORMANCE_FILE)
+            # Keep date-based counts separately; a new KST date naturally starts at zero.
+            recent_days = sorted(self.daily_counts)[-90:]
+            daily_tmp = DAILY_COUNT_FILE.with_suffix(".tmp")
+            daily_tmp.write_text(json.dumps({day: self.daily_counts[day] for day in recent_days},
+                                            ensure_ascii=False), encoding="utf-8")
+            daily_tmp.replace(DAILY_COUNT_FILE)
 
     def receive(self, payload: dict[str, Any]) -> None:
         code = str(payload.get("code", ""))
@@ -872,11 +969,12 @@ class Scanner:
             row["stop_price_3pct"] = round(float(row["first_seen_price"]) * 0.97, 8) if row.get("first_seen_price") else None
             prices = [float(point[1]) for point in row.get("chart_prices", [])]
             row["recent_low"] = round(min(prices), 8) if prices else None
+            row.update(self.public_daily_count(coin, int(time.time() * 1000)))
             rows.append(row)
         stage_order = {"돌파 확인": 0, "소액 시도 가능": 1, "기다림": 2, "매수 금지": 3}
         rows.sort(key=lambda row: (stage_order.get(row["action"], 9), -row["score"], -(row["first_seen_at"] or 0)))
         return {
-            "engine": "BES Flow A/B Challenger V2.3",
+            "engine": "BES Flow A/B Challenger V2.4",
             "connected": self.connected,
             "updated_at_ms": self.updated_at,
             "market_count": len(self.coins),
@@ -888,6 +986,7 @@ class Scanner:
             "results": rows,
             "events": self.events[-100:],
             "performance_records": self.performance_records[-200:],
+            "daily_counts": self.daily_counts.get(kst_date(int(time.time() * 1000)), {}),
         }
 
 
@@ -898,7 +997,7 @@ async def main() -> None:
         app = web.Application()
         app.router.add_get("/api/state", lambda _: web.json_response(scanner.snapshot()))
         app.router.add_get("/api/performance", lambda _: web.json_response({
-            "engine": "BES Flow A/B Challenger V2.3",
+            "engine": "BES Flow A/B Challenger V2.4",
             "records": scanner.performance_records[-2000:],
         }))
         app.router.add_get("/health", lambda _: web.json_response({"ok": scanner.connected, "markets": len(scanner.coins)}))
