@@ -37,6 +37,7 @@ OTHER_STATE_LOCK_MS = 10_000
 CHART_WINDOW_MS = 3 * 60_000
 CHART_BUCKET_MS = 5_000
 CANDIDATE_HOLD_MS = 3 * 60_000
+A_CONTEXT_REFRESH_MS = 5 * 60_000
 STATE_STRENGTH = {"일반 감시": 0, "관찰 유지": 1, "수급 유입": 2, "상승 가능": 3}
 
 
@@ -94,6 +95,12 @@ class Coin:
     flow_cooldown_until: int = 0
     decision_action: str = ""
     decision_changed_at: int = 0
+    a_checked_at: int = 0
+    a_near: bool = False
+    a_price: float | None = None
+    a_distance_percent: float | None = None
+    a_defended: bool = False
+    a_reason: str = "4시간봉 확인 전"
 
 
 def pct(new: float, old: float) -> float:
@@ -102,6 +109,49 @@ def pct(new: float, old: float) -> float:
 
 def clip(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
+
+
+def ema(values: list[float], length: int) -> float:
+    if not values:
+        return 0.0
+    alpha = 2.0 / (length + 1.0)
+    result = values[0]
+    for value in values[1:]:
+        result = value * alpha + result * (1.0 - alpha)
+    return result
+
+
+def analyze_a_context(candles: list[dict[str, Any]], current_price: float) -> dict[str, Any]:
+    """Conservative 4H A proxy: confirmed swing low, no low break, and price still near it."""
+    rows = sorted(candles, key=lambda item: str(item.get("candle_date_time_utc", "")))
+    if len(rows) < 12 or current_price <= 0:
+        return {"near": False, "price": None, "distance": None, "defended": False, "reason": "4시간봉 자료 부족"}
+    lows = [float(item["low_price"]) for item in rows]
+    closes = [float(item["trade_price"]) for item in rows]
+    pivots = [i for i in range(2, len(rows) - 2)
+              if lows[i] < min(lows[i - 2:i]) and lows[i] <= min(lows[i + 1:i + 3])]
+    recent = [i for i in pivots if i >= len(rows) - 14]
+    if not recent:
+        return {"near": False, "price": None, "distance": None, "defended": False, "reason": "최근 확인된 4H A 없음"}
+    index = recent[-1]
+    a_price = lows[index]
+    subsequent_low = min(lows[index + 1:]) if index + 1 < len(lows) else current_price
+    defended = subsequent_low >= a_price * 0.99 and current_price >= a_price * 0.99
+    distance = pct(current_price, a_price)
+    near = defended and -1.0 <= distance <= 7.0
+    recovered = current_price >= ema(closes[-20:], 20) * 0.985
+    if not defended:
+        reason = "A 기준 저점 이탈"
+    elif distance > 7.0:
+        reason = "A에서 이미 멀어짐"
+    elif distance < -1.0:
+        reason = "A 저점 재확인 필요"
+    elif not recovered:
+        reason = "A 부근·4H 구조 회복 대기"
+    else:
+        reason = "A 부근·저점 방어 확인"
+    return {"near": near, "price": a_price, "distance": distance,
+            "defended": defended, "recovered": recovered, "reason": reason}
 
 
 def metrics(coin: Coin, now: int, seconds: int) -> dict[str, float]:
@@ -306,6 +356,11 @@ def trade_decision(coin: Coin, row: dict[str, float], btc_falling: bool = False)
 
     if btc_falling and action in {"소액 시도 가능", "돌파 확인"}:
         reason += " · BTC 약세이므로 비중 축소"
+    route = "A+수급" if coin.a_near else "기존 수급"
+    if coin.a_near and action == "기다림":
+        reason = "A 부근 확인 · " + reason
+    elif coin.a_near and action in {"소액 시도 가능", "돌파 확인"}:
+        reason = "A 저점 방어+" + reason
     entry_low = first * 0.995 if first else None
     entry_high = first * 1.01 if first else None
     return {
@@ -317,6 +372,12 @@ def trade_decision(coin: Coin, row: dict[str, float], btc_falling: bool = False)
         "breakout_price": round(short_resistance, 8) if short_resistance else None,
         "stop_distance_percent": round(stop_distance, 2) if stop_distance < 99 else None,
         "chase": overheated,
+        "detection_route": route,
+        "a_near": coin.a_near,
+        "a_price": round(coin.a_price, 8) if coin.a_price else None,
+        "a_distance_percent": round(coin.a_distance_percent, 2) if coin.a_distance_percent is not None else None,
+        "a_defended": coin.a_defended,
+        "a_reason": coin.a_reason,
     }
 
 
@@ -484,6 +545,41 @@ class Scanner:
         self.connected = False
         self.updated_at = 0
         self.performance_records = self.load_performance()
+        self.session: ClientSession | None = None
+        self.a_refreshing: set[str] = set()
+
+    async def refresh_a_context(self, coin: Coin) -> None:
+        now = int(time.time() * 1000)
+        if self.session is None or coin.market in self.a_refreshing or now - coin.a_checked_at < A_CONTEXT_REFRESH_MS:
+            return
+        self.a_refreshing.add(coin.market)
+        try:
+            async with self.session.get(f"{REST_API}/candles/minutes/240",
+                                        params={"market": coin.market, "count": 40}) as response:
+                response.raise_for_status()
+                candles = await response.json()
+            current = coin.ticks[-1].price if coin.ticks else 0.0
+            context = analyze_a_context(candles, current)
+            coin.a_checked_at = now
+            coin.a_near = bool(context["near"])
+            coin.a_price = context["price"]
+            coin.a_distance_percent = context["distance"]
+            coin.a_defended = bool(context["defended"])
+            coin.a_reason = str(context["reason"])
+            signal_id = f"{coin.market}-{coin.flow_first_at}"
+            record = next((item for item in reversed(self.performance_records)
+                           if item.get("signal_id") == signal_id), None)
+            if record is not None:
+                record["challenger_route"] = coin.a_near
+                record["detection_route"] = "A+수급" if coin.a_near else "기존 수급"
+                record["a_price"] = coin.a_price
+                record["a_distance_percent"] = coin.a_distance_percent
+                record["a_reason"] = coin.a_reason
+        except Exception as exc:
+            coin.a_checked_at = now
+            coin.a_reason = f"4시간봉 조회 실패: {type(exc).__name__}"
+        finally:
+            self.a_refreshing.discard(coin.market)
 
     def load_performance(self) -> list[dict[str, Any]]:
         try:
@@ -502,6 +598,9 @@ class Scanner:
                 "first_at_ms": coin.flow_first_at, "first_price": coin.flow_first_price,
                 "first_flow": round(coin.flow_first_strength, 4), "status": "1차 포착",
                 "peak_return": 0.0, "mae": 0.0, "snapshots": {},
+                "champion_route": True, "challenger_route": coin.a_near,
+                "detection_route": "A+수급" if coin.a_near else "기존 수급",
+                "a_price": coin.a_price, "a_distance_percent": coin.a_distance_percent,
             })
             return
         if record is None:
@@ -510,6 +609,10 @@ class Scanner:
             record.update({"second_at_ms": coin.flow_second_at, "second_price": float(row["price"]),
                            "second_flow": round(coin.flow_second_strength, 4), "status": "2회 확인",
                            "invalidation_price": coin.flow_invalidation_price})
+            record["challenger_route"] = bool(coin.a_near)
+            record["detection_route"] = "A+수급" if coin.a_near else "기존 수급"
+            record["a_price"] = coin.a_price
+            record["a_distance_percent"] = coin.a_distance_percent
         elif coin.flow_stage == "초입 검토":
             record.update({"confirmed_at_ms": now, "status": "진행 중"})
         elif coin.flow_stage == "탈락":
@@ -561,6 +664,7 @@ class Scanner:
             record["first_actionable_type"] = action
 
     async def bootstrap(self, session: ClientSession) -> None:
+        self.session = session
         async with session.get(f"{REST_API}/market/all", params={"isDetails": "true"}) as response:
             markets = await response.json()
         codes = [
@@ -593,6 +697,7 @@ class Scanner:
             "flow_invalidation_price", "flow_hold_until", "flow_exit_reason",
             "flow_cooldown_until",
             "decision_action", "decision_changed_at",
+            "a_checked_at", "a_near", "a_price", "a_distance_percent", "a_defended", "a_reason",
         )
         for code, values in saved.items():
             coin = self.coins.get(code)
@@ -634,6 +739,12 @@ class Scanner:
                     "flow_cooldown_until": coin.flow_cooldown_until,
                     "decision_action": coin.decision_action,
                     "decision_changed_at": coin.decision_changed_at,
+                    "a_checked_at": coin.a_checked_at,
+                    "a_near": coin.a_near,
+                    "a_price": coin.a_price,
+                    "a_distance_percent": coin.a_distance_percent,
+                    "a_defended": coin.a_defended,
+                    "a_reason": coin.a_reason,
                 }
                 for code, coin in self.coins.items()
             }
@@ -695,6 +806,8 @@ class Scanner:
                 btc_row = self.latest.get("KRW-BTC", {})
                 btc_falling = float(btc_row.get("change_3m", 0.0)) <= -0.35 or float(btc_row.get("change_1m", 0.0)) <= -0.20
                 update_flow_sequence(coin, self.latest[code], now, btc_falling)
+                if coin.flow_stage and now - coin.a_checked_at >= A_CONTEXT_REFRESH_MS:
+                    asyncio.create_task(self.refresh_a_context(coin))
                 if coin.flow_stage != previous_flow_stage:
                     self.record_flow_transition(coin, previous_flow_stage, previous_first_at, self.latest[code], now)
                 self.update_flow_performance(coin, self.latest[code], now)
@@ -763,12 +876,14 @@ class Scanner:
         stage_order = {"돌파 확인": 0, "소액 시도 가능": 1, "기다림": 2, "매수 금지": 3}
         rows.sort(key=lambda row: (stage_order.get(row["action"], 9), -row["score"], -(row["first_seen_at"] or 0)))
         return {
-            "engine": "BES Flow Decision V2.2",
+            "engine": "BES Flow A/B Challenger V2.3",
             "connected": self.connected,
             "updated_at_ms": self.updated_at,
             "market_count": len(self.coins),
             "candidate_count": len(rows),
             "buy_review_count": sum(row["action"] in {"소액 시도 가능", "돌파 확인"} for row in rows),
+            "champion_count": sum(row.get("detection_route") == "기존 수급" for row in rows),
+            "challenger_count": sum(row.get("detection_route") == "A+수급" for row in rows),
             "btc_market": {"state": "단기 하락·고위험" if btc_falling else "보통", "blocking": False},
             "results": rows,
             "events": self.events[-100:],
@@ -783,7 +898,7 @@ async def main() -> None:
         app = web.Application()
         app.router.add_get("/api/state", lambda _: web.json_response(scanner.snapshot()))
         app.router.add_get("/api/performance", lambda _: web.json_response({
-            "engine": "BES Flow Decision V2.2",
+            "engine": "BES Flow A/B Challenger V2.3",
             "records": scanner.performance_records[-2000:],
         }))
         app.router.add_get("/health", lambda _: web.json_response({"ok": scanner.connected, "markets": len(scanner.coins)}))
