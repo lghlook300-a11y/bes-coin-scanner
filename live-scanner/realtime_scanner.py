@@ -105,6 +105,13 @@ class Coin:
     a_distance_percent: float | None = None
     a_defended: bool = False
     a_reason: str = "4시간봉 확인 전"
+    abc_stage: str = ""
+    abc_cycle_id: int | None = None
+    abc_a_price: float | None = None
+    abc_b_price: float | None = None
+    abc_c_price: float | None = None
+    abc_updated_at: int = 0
+    abc_reason: str = "PRE-A 탐색 중"
 
 
 def pct(new: float, old: float) -> float:
@@ -175,6 +182,32 @@ def analyze_a_context(candles: list[dict[str, Any]], current_price: float) -> di
         reason = "A 부근·저점 방어 확인"
     return {"near": near, "price": a_price, "distance": distance,
             "defended": defended, "recovered": recovered, "reason": reason}
+
+
+def analyze_fast_a_context(candles: list[dict[str, Any]], current_price: float) -> dict[str, Any]:
+    """Early, unconfirmed 4H low candidate. This never acts as a buy signal."""
+    rows = sorted(candles, key=lambda item: str(item.get("candle_date_time_utc", "")))
+    if len(rows) < 10 or current_price <= 0:
+        return {"candidate": False, "price": None, "reason": "PRE-A 자료 부족"}
+    recent = rows[-3:]
+    lows = [float(item["low_price"]) for item in recent]
+    candidate_price = min(lows)
+    candidate = recent[lows.index(candidate_price)]
+    opening = float(candidate["opening_price"])
+    close = float(candidate["trade_price"])
+    high = float(candidate["high_price"])
+    low = float(candidate["low_price"])
+    body = max(abs(close - opening), max(high - low, 1e-12) * 0.08)
+    lower_wick = max(0.0, min(opening, close) - low)
+    prior_close = float(rows[-6]["trade_price"])
+    decline = pct(close, prior_close)
+    recovery = pct(current_price, candidate_price)
+    previous_floor = min(float(item["low_price"]) for item in rows[-9:-3])
+    near_new_low = candidate_price <= previous_floor * 1.012
+    slowing = lower_wick >= body * 0.55 or close >= low * 1.006
+    detected = near_new_low and decline <= 0.5 and slowing and 0.0 <= recovery <= 5.0
+    return {"candidate": detected, "price": candidate_price,
+            "reason": "4H 새 저점 부근·하락 둔화" if detected else "PRE-A 조건 대기"}
 
 
 def metrics(coin: Coin, now: int, seconds: int) -> dict[str, float]:
@@ -585,9 +618,11 @@ class Scanner:
         day = self.daily_counts.setdefault(kst_session_date(now), {})
         return day.setdefault(coin.market, {
             "symbol": coin.market.split("-", 1)[1], "total_count": 0, "a_count": 0,
+            "pre_a_count": 0, "a_defense_count": 0,
             "second_count": 0, "actionable_count": 0, "last_counted_at_ms": 0,
             "last_seen_at_ms": 0, "prices": [], "counted_signal_ids": [],
-            "a_signal_ids": [], "second_signal_ids": [], "actionable_signal_ids": [],
+            "a_signal_ids": [], "pre_a_signal_ids": [], "a_defense_signal_ids": [],
+            "second_signal_ids": [], "actionable_signal_ids": [],
         })
 
     def count_new_detection(self, coin: Coin, now: int, price: float) -> None:
@@ -613,6 +648,8 @@ class Scanner:
             return
         key, ids_key = {
             "a": ("a_count", "a_signal_ids"),
+            "pre_a": ("pre_a_count", "pre_a_signal_ids"),
+            "a_defense": ("a_defense_count", "a_defense_signal_ids"),
             "second": ("second_count", "second_signal_ids"),
             "actionable": ("actionable_count", "actionable_signal_ids"),
         }[kind]
@@ -636,6 +673,8 @@ class Scanner:
         return {
             "daily_detection_count": int(row.get("total_count", 0)),
             "daily_a_count": int(row.get("a_count", 0)),
+            "daily_pre_a_count": int(row.get("pre_a_count", 0)),
+            "daily_a_defense_count": int(row.get("a_defense_count", 0)),
             "daily_second_count": int(row.get("second_count", 0)),
             "daily_actionable_count": int(row.get("actionable_count", 0)),
             "daily_last_seen_at_ms": int(row.get("last_seen_at_ms", 0)),
@@ -664,6 +703,8 @@ class Scanner:
                 "symbol": row.get("symbol") or market.split("-", 1)[-1],
                 "count": total,
                 "a_count": int(row.get("a_count", 0)),
+                "pre_a_count": int(row.get("pre_a_count", 0)),
+                "a_defense_count": int(row.get("a_defense_count", 0)),
                 "second_count": int(row.get("second_count", 0)),
                 "actionable_count": int(row.get("actionable_count", 0)),
                 "last_seen_at_ms": int(row.get("last_seen_at_ms", 0)),
@@ -672,6 +713,72 @@ class Scanner:
         ranked.sort(key=lambda row: (-row["count"], -row["second_count"],
                                     -row["actionable_count"], -row["last_seen_at_ms"], row["symbol"]))
         return [dict(row, rank=index) for index, row in enumerate(ranked[:5], 1)]
+
+    def set_abc_stage(self, coin: Coin, stage: str, reason: str, now: int) -> None:
+        if coin.abc_stage == stage:
+            coin.abc_reason = reason
+            return
+        coin.abc_stage = stage
+        coin.abc_reason = reason
+        coin.abc_updated_at = now
+        if stage == "PRE-A":
+            self.count_stage_once(coin, now, "pre_a")
+        elif stage == "A 방어":
+            self.count_stage_once(coin, now, "a_defense")
+
+    def update_abc_context(self, coin: Coin, fast: dict[str, Any], confirmed: dict[str, Any],
+                           current: float, now: int) -> None:
+        if current <= 0:
+            return
+        if coin.abc_a_price and current < coin.abc_a_price * 0.99:
+            self.set_abc_stage(coin, "A 실패", "A 기준 저점 이탈", now)
+            return
+        confirmed_price = confirmed.get("price") if confirmed.get("defended") else None
+        if not coin.abc_stage or coin.abc_stage == "A 실패":
+            candidate_price = confirmed_price or (fast.get("price") if fast.get("candidate") else None)
+            if (coin.abc_stage == "A 실패" and candidate_price and coin.abc_a_price
+                    and float(candidate_price) >= coin.abc_a_price * 0.985):
+                return
+            if candidate_price:
+                coin.abc_cycle_id = now
+                coin.abc_a_price = float(candidate_price)
+                coin.abc_b_price = None
+                coin.abc_c_price = None
+                if confirmed_price:
+                    self.set_abc_stage(coin, "A 확인", "4H 피벗 A와 저점 방어 확인", now)
+                else:
+                    self.set_abc_stage(coin, "PRE-A", str(fast.get("reason")), now)
+            return
+        if coin.abc_stage == "PRE-A":
+            if confirmed_price and abs(pct(float(confirmed_price), float(coin.abc_a_price))) <= 4.0:
+                coin.abc_a_price = float(confirmed_price)
+                self.set_abc_stage(coin, "A 확인", "4H 피벗 A 확정", now)
+            elif coin.flow_second_at and current >= float(coin.abc_a_price):
+                self.set_abc_stage(coin, "A 방어", "A 저점 유지·반복 수급 확인", now)
+        elif coin.abc_stage == "A 방어" and confirmed_price:
+            coin.abc_a_price = float(confirmed_price)
+            self.set_abc_stage(coin, "A 확인", "4H 피벗 A 확정", now)
+
+    def update_abc_live(self, coin: Coin, current: float, now: int) -> None:
+        if not coin.abc_stage or not coin.abc_a_price or current <= 0:
+            return
+        if current < coin.abc_a_price * 0.99:
+            self.set_abc_stage(coin, "A 실패", "A 기준 저점 이탈", now)
+            return
+        if coin.abc_stage == "PRE-A" and coin.flow_second_at:
+            self.set_abc_stage(coin, "A 방어", "A 저점 유지·반복 수급 확인", now)
+        if coin.abc_stage in {"A 확인", "B 진행"}:
+            coin.abc_b_price = max(float(coin.abc_b_price or current), current)
+            if coin.abc_b_price >= coin.abc_a_price * 1.02:
+                self.set_abc_stage(coin, "B 진행", "A 이후 2% 이상 반등", now)
+            if (coin.abc_stage == "B 진행" and current <= coin.abc_b_price * 0.99
+                    and current > coin.abc_a_price * 1.01):
+                coin.abc_c_price = current
+                self.set_abc_stage(coin, "C 눌림 대기", "B 이후 눌림·A 저점 유지", now)
+        elif coin.abc_stage == "C 눌림 대기":
+            coin.abc_c_price = min(float(coin.abc_c_price or current), current)
+            if coin.abc_b_price and current >= coin.abc_b_price * 1.003:
+                self.set_abc_stage(coin, "ABC 확인", "C 방어 후 B 고점 돌파", now)
 
     async def refresh_a_context(self, coin: Coin) -> None:
         now = int(time.time() * 1000)
@@ -685,12 +792,14 @@ class Scanner:
                 candles = await response.json()
             current = coin.ticks[-1].price if coin.ticks else 0.0
             context = analyze_a_context(candles, current)
+            fast_context = analyze_fast_a_context(candles, current)
             coin.a_checked_at = now
             coin.a_near = bool(context["near"])
             coin.a_price = context["price"]
             coin.a_distance_percent = context["distance"]
             coin.a_defended = bool(context["defended"])
             coin.a_reason = str(context["reason"])
+            self.update_abc_context(coin, fast_context, context, current, now)
             signal_id = f"{coin.market}-{coin.flow_first_at}"
             record = next((item for item in reversed(self.performance_records)
                            if item.get("signal_id") == signal_id), None)
@@ -830,6 +939,8 @@ class Scanner:
             "last_sequence_ended_at",
             "decision_action", "decision_changed_at",
             "a_checked_at", "a_near", "a_price", "a_distance_percent", "a_defended", "a_reason",
+            "abc_stage", "abc_cycle_id", "abc_a_price", "abc_b_price", "abc_c_price",
+            "abc_updated_at", "abc_reason",
         )
         for code, values in saved.items():
             coin = self.coins.get(code)
@@ -878,6 +989,13 @@ class Scanner:
                     "a_distance_percent": coin.a_distance_percent,
                     "a_defended": coin.a_defended,
                     "a_reason": coin.a_reason,
+                    "abc_stage": coin.abc_stage,
+                    "abc_cycle_id": coin.abc_cycle_id,
+                    "abc_a_price": coin.abc_a_price,
+                    "abc_b_price": coin.abc_b_price,
+                    "abc_c_price": coin.abc_c_price,
+                    "abc_updated_at": coin.abc_updated_at,
+                    "abc_reason": coin.abc_reason,
                 }
                 for code, coin in self.coins.items()
             }
@@ -945,7 +1063,9 @@ class Scanner:
                 btc_row = self.latest.get("KRW-BTC", {})
                 btc_falling = float(btc_row.get("change_3m", 0.0)) <= -0.35 or float(btc_row.get("change_1m", 0.0)) <= -0.20
                 update_flow_sequence(coin, self.latest[code], now, btc_falling)
-                if coin.flow_stage and now - coin.a_checked_at >= A_CONTEXT_REFRESH_MS:
+                self.update_abc_live(coin, float(self.latest[code].get("price", 0.0)), now)
+                abc_tracking = coin.abc_stage in {"PRE-A", "A 방어", "A 확인", "B 진행", "C 눌림 대기"}
+                if (coin.flow_stage or abc_tracking) and now - coin.a_checked_at >= A_CONTEXT_REFRESH_MS:
                     asyncio.create_task(self.refresh_a_context(coin))
                 if coin.flow_stage != previous_flow_stage:
                     self.record_flow_transition(coin, previous_flow_stage, previous_first_at, self.latest[code], now)
@@ -996,7 +1116,10 @@ class Scanner:
         btc_falling = float(btc_row.get("change_3m", 0.0)) <= -0.35 or float(btc_row.get("change_1m", 0.0)) <= -0.20
         rows = []
         for code, coin in self.coins.items():
-            if code not in self.latest or not coin.flow_stage:
+            abc_visible = bool(coin.abc_stage) and (
+                coin.abc_stage not in {"ABC 확인", "A 실패"} or now - coin.abc_updated_at <= 30 * 60_000
+            )
+            if code not in self.latest or (not coin.flow_stage and not abc_visible):
                 continue
             row = public_coin(coin, self.latest[code])
             row["first_seen_at"] = coin.flow_first_at
@@ -1014,11 +1137,14 @@ class Scanner:
             prices = [float(point[1]) for point in row.get("chart_prices", [])]
             row["recent_low"] = round(min(prices), 8) if prices else None
             row.update(self.public_daily_count(coin, now))
+            row.update({"abc_stage": coin.abc_stage or "PRE-A 탐색", "abc_reason": coin.abc_reason,
+                        "abc_a_price": coin.abc_a_price, "abc_b_price": coin.abc_b_price,
+                        "abc_c_price": coin.abc_c_price, "abc_updated_at_ms": coin.abc_updated_at})
             rows.append(row)
         stage_order = {"돌파 확인": 0, "소액 시도 가능": 1, "기다림": 2, "매수 금지": 3}
         rows.sort(key=lambda row: (stage_order.get(row["action"], 9), -row["score"], -(row["first_seen_at"] or 0)))
         return {
-            "engine": "BES Flow A/B Challenger V2.5",
+            "engine": "BES Flow A/B Challenger V2.6",
             "connected": self.connected,
             "updated_at_ms": self.updated_at,
             "market_count": len(self.coins),
@@ -1044,7 +1170,7 @@ async def main() -> None:
         app = web.Application()
         app.router.add_get("/api/state", lambda _: web.json_response(scanner.snapshot()))
         app.router.add_get("/api/performance", lambda _: web.json_response({
-            "engine": "BES Flow A/B Challenger V2.5",
+            "engine": "BES Flow A/B Challenger V2.6",
             "records": scanner.performance_records[-2000:],
         }))
         app.router.add_get("/health", lambda _: web.json_response({"ok": scanner.connected, "markets": len(scanner.coins)}))
