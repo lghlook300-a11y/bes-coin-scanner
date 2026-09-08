@@ -1145,15 +1145,45 @@ class Scanner:
         rows.sort(key=lambda row: (stage_order.get(row["action"], 9), -row["score"], -(row["first_seen_at"] or 0)))
         abc_order = {"ABC 확인": 0, "C 눌림 대기": 1, "B 진행": 2,
                      "A 확인": 3, "A 방어": 4, "PRE-A": 5}
-        a_tracking = [row for row in rows if row.get("abc_stage") in abc_order]
+        for row in rows:
+            a_price = float(row.get("abc_a_price") or 0.0)
+            current = float(row.get("current_price") or 0.0)
+            a_distance = pct(current, a_price) if a_price and current else None
+            row["abc_current_distance"] = round(a_distance, 3) if a_distance is not None else None
+            stage = str(row.get("abc_stage", ""))
+            repeated_flow = row.get("flow_second_strength") is not None
+            buy_flow = float(row.get("buy_ratio_30s", 0.0)) >= 52.0 and float(row.get("buy_ratio_1m", 0.0)) >= 50.0
+            not_overheated = float(row.get("change_3m", 0.0)) < 3.0 and row.get("action") != "매수 금지"
+            rising_detection = row.get("daily_price_trend") != "포착가 하락형"
+            row["entry_review"] = bool(
+                a_distance is not None and 1.0 <= a_distance <= 4.0
+                and stage in {"A 방어", "A 확인", "C 눌림 대기"}
+                and repeated_flow and buy_flow and not_overheated and rising_detection
+            )
+            if row["entry_review"]:
+                row["entry_review_reason"] = "A 1~4%·저점 방어·2차 수급·매수체결 우위"
+            elif stage in {"PRE-A", "A 방어"} and a_distance is not None and -1.0 <= a_distance <= 3.0:
+                row["entry_review_reason"] = "A 초기 관찰·추가 방어와 2차 수급 대기"
+            elif a_distance is not None and a_distance > 4.0:
+                row["entry_review_reason"] = "A에서 4% 초과·추격 주의"
+            else:
+                row["entry_review_reason"] = "조건 재확인 필요"
+        entry_review = [row for row in rows if row.get("entry_review")]
+        entry_review.sort(key=lambda row: (
+            {"C 눌림 대기": 0, "A 확인": 1, "A 방어": 2}.get(row.get("abc_stage"), 9),
+            -int(row.get("daily_a_defense_count", 0)), -int(row.get("score", 0))))
+        a_tracking = [row for row in rows if not row.get("entry_review")
+                      and row.get("abc_stage") in {"PRE-A", "A 방어"}
+                      and row.get("abc_current_distance") is not None
+                      and -1.0 <= float(row["abc_current_distance"]) <= 3.0]
         a_tracking.sort(key=lambda row: (
-            abc_order[row["abc_stage"]],
+            {"A 방어": 0, "PRE-A": 1}[row["abc_stage"]],
             -int(row.get("daily_a_defense_count", 0)),
             -int(row.get("daily_pre_a_count", 0)),
             -int(row.get("score", 0)),
         ))
         return {
-            "engine": "BES Flow A/B Challenger V2.6.2",
+            "engine": "BES Flow A/B Challenger V2.7",
             "connected": self.connected,
             "updated_at_ms": self.updated_at,
             "market_count": len(self.coins),
@@ -1168,6 +1198,7 @@ class Scanner:
             "counting_window": {"start_at_ms": session_start, "end_at_ms": session_end,
                                 "label": "매일 오전 9시 ~ 다음 날 오전 9시 (KST)"},
             "top_detection_counts": self.top_daily_counts(now),
+            "entry_review_results": entry_review[:3],
             "a_tracking_results": a_tracking[:5],
             "daily_counts": self.daily_counts.get(kst_session_date(now), {}),
         }
@@ -1180,7 +1211,7 @@ async def main() -> None:
         app = web.Application()
         app.router.add_get("/api/state", lambda _: web.json_response(scanner.snapshot()))
         app.router.add_get("/api/performance", lambda _: web.json_response({
-            "engine": "BES Flow A/B Challenger V2.6.2",
+            "engine": "BES Flow A/B Challenger V2.7",
             "records": scanner.performance_records[-2000:],
         }))
         app.router.add_get("/health", lambda _: web.json_response({"ok": scanner.connected, "markets": len(scanner.coins)}))
