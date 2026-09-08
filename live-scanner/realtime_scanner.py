@@ -1143,8 +1143,17 @@ class Scanner:
             rows.append(row)
         stage_order = {"돌파 확인": 0, "소액 시도 가능": 1, "기다림": 2, "매수 금지": 3}
         rows.sort(key=lambda row: (stage_order.get(row["action"], 9), -row["score"], -(row["first_seen_at"] or 0)))
+        abc_order = {"ABC 확인": 0, "C 눌림 대기": 1, "B 진행": 2,
+                     "A 확인": 3, "A 방어": 4, "PRE-A": 5}
+        a_tracking = [row for row in rows if row.get("abc_stage") in abc_order]
+        a_tracking.sort(key=lambda row: (
+            abc_order[row["abc_stage"]],
+            -int(row.get("daily_a_defense_count", 0)),
+            -int(row.get("daily_pre_a_count", 0)),
+            -int(row.get("score", 0)),
+        ))
         return {
-            "engine": "BES Flow A/B Challenger V2.6",
+            "engine": "BES Flow A/B Challenger V2.6.2",
             "connected": self.connected,
             "updated_at_ms": self.updated_at,
             "market_count": len(self.coins),
@@ -1159,6 +1168,7 @@ class Scanner:
             "counting_window": {"start_at_ms": session_start, "end_at_ms": session_end,
                                 "label": "매일 오전 9시 ~ 다음 날 오전 9시 (KST)"},
             "top_detection_counts": self.top_daily_counts(now),
+            "a_tracking_results": a_tracking[:5],
             "daily_counts": self.daily_counts.get(kst_session_date(now), {}),
         }
 
@@ -1170,7 +1180,7 @@ async def main() -> None:
         app = web.Application()
         app.router.add_get("/api/state", lambda _: web.json_response(scanner.snapshot()))
         app.router.add_get("/api/performance", lambda _: web.json_response({
-            "engine": "BES Flow A/B Challenger V2.6",
+            "engine": "BES Flow A/B Challenger V2.6.2",
             "records": scanner.performance_records[-2000:],
         }))
         app.router.add_get("/health", lambda _: web.json_response({"ok": scanner.connected, "markets": len(scanner.coins)}))
