@@ -23,7 +23,7 @@ DATA_DIR = Path(os.environ.get("BES_DATA_DIR", "data-live"))
 STATE_FILE = DATA_DIR / "scanner_state.json"
 EVENT_FILE = DATA_DIR / "events.jsonl"
 PERFORMANCE_FILE = DATA_DIR / "flow_performance.json"
-DAILY_COUNT_FILE = DATA_DIR / "daily_detection_counts.json"
+DAILY_COUNT_FILE = DATA_DIR / "daily_detection_counts_v2_5.json"
 STATIC_DIR = Path(__file__).with_name("static")
 STABLE = {"USDT", "USDC", "DAI", "TUSD", "FDUSD", "USDE", "PYUSD"}
 STATE_CONFIRM_MS = {
@@ -118,8 +118,20 @@ def clip(value: float, low: float, high: float) -> float:
 KST = timezone(timedelta(hours=9))
 
 
-def kst_date(timestamp_ms: int) -> str:
-    return datetime.fromtimestamp(timestamp_ms / 1000, KST).strftime("%Y-%m-%d")
+def kst_session_date(timestamp_ms: int) -> str:
+    """Return the KST trading-day key whose boundary is 09:00, not midnight."""
+    local = datetime.fromtimestamp(timestamp_ms / 1000, KST)
+    if local.hour < 9:
+        local -= timedelta(days=1)
+    return local.strftime("%Y-%m-%d")
+
+
+def kst_session_bounds(timestamp_ms: int) -> tuple[int, int]:
+    local = datetime.fromtimestamp(timestamp_ms / 1000, KST)
+    start_date = local.date() if local.hour >= 9 else (local - timedelta(days=1)).date()
+    start = datetime.combine(start_date, datetime.min.time(), KST) + timedelta(hours=9)
+    end = start + timedelta(days=1)
+    return int(start.timestamp() * 1000), int(end.timestamp() * 1000)
 
 
 def ema(values: list[float], length: int) -> float:
@@ -570,7 +582,7 @@ class Scanner:
             return {}
 
     def daily_row(self, coin: Coin, now: int) -> dict[str, Any]:
-        day = self.daily_counts.setdefault(kst_date(now), {})
+        day = self.daily_counts.setdefault(kst_session_date(now), {})
         return day.setdefault(coin.market, {
             "symbol": coin.market.split("-", 1)[1], "total_count": 0, "a_count": 0,
             "second_count": 0, "actionable_count": 0, "last_counted_at_ms": 0,
@@ -630,6 +642,36 @@ class Scanner:
             "daily_price_trend": trend,
             "daily_detection_prices": prices,
         }
+
+    def top_daily_counts(self, now: int) -> list[dict[str, Any]]:
+        day = self.daily_counts.get(kst_session_date(now), {})
+        ranked = []
+        for market, row in day.items():
+            total = int(row.get("total_count", 0))
+            if total <= 0:
+                continue
+            prices = [float(value) for value in row.get("prices", [])]
+            if len(prices) < 2:
+                trend = "비교 전"
+            elif prices[-1] > prices[0] * 1.003:
+                trend = "포착가 상승형"
+            elif prices[-1] < prices[0] * 0.997:
+                trend = "포착가 하락형"
+            else:
+                trend = "포착가 보합형"
+            ranked.append({
+                "market": market,
+                "symbol": row.get("symbol") or market.split("-", 1)[-1],
+                "count": total,
+                "a_count": int(row.get("a_count", 0)),
+                "second_count": int(row.get("second_count", 0)),
+                "actionable_count": int(row.get("actionable_count", 0)),
+                "last_seen_at_ms": int(row.get("last_seen_at_ms", 0)),
+                "price_trend": trend,
+            })
+        ranked.sort(key=lambda row: (-row["count"], -row["second_count"],
+                                    -row["actionable_count"], -row["last_seen_at_ms"], row["symbol"]))
+        return [dict(row, rank=index) for index, row in enumerate(ranked[:5], 1)]
 
     async def refresh_a_context(self, coin: Coin) -> None:
         now = int(time.time() * 1000)
@@ -948,6 +990,8 @@ class Scanner:
             delay = min(delay * 2, 30)
 
     def snapshot(self) -> dict[str, Any]:
+        now = int(time.time() * 1000)
+        session_start, session_end = kst_session_bounds(now)
         btc_row = self.latest.get("KRW-BTC", {})
         btc_falling = float(btc_row.get("change_3m", 0.0)) <= -0.35 or float(btc_row.get("change_1m", 0.0)) <= -0.20
         rows = []
@@ -969,12 +1013,12 @@ class Scanner:
             row["stop_price_3pct"] = round(float(row["first_seen_price"]) * 0.97, 8) if row.get("first_seen_price") else None
             prices = [float(point[1]) for point in row.get("chart_prices", [])]
             row["recent_low"] = round(min(prices), 8) if prices else None
-            row.update(self.public_daily_count(coin, int(time.time() * 1000)))
+            row.update(self.public_daily_count(coin, now))
             rows.append(row)
         stage_order = {"돌파 확인": 0, "소액 시도 가능": 1, "기다림": 2, "매수 금지": 3}
         rows.sort(key=lambda row: (stage_order.get(row["action"], 9), -row["score"], -(row["first_seen_at"] or 0)))
         return {
-            "engine": "BES Flow A/B Challenger V2.4",
+            "engine": "BES Flow A/B Challenger V2.5",
             "connected": self.connected,
             "updated_at_ms": self.updated_at,
             "market_count": len(self.coins),
@@ -986,7 +1030,10 @@ class Scanner:
             "results": rows,
             "events": self.events[-100:],
             "performance_records": self.performance_records[-200:],
-            "daily_counts": self.daily_counts.get(kst_date(int(time.time() * 1000)), {}),
+            "counting_window": {"start_at_ms": session_start, "end_at_ms": session_end,
+                                "label": "매일 오전 9시 ~ 다음 날 오전 9시 (KST)"},
+            "top_detection_counts": self.top_daily_counts(now),
+            "daily_counts": self.daily_counts.get(kst_session_date(now), {}),
         }
 
 
@@ -997,7 +1044,7 @@ async def main() -> None:
         app = web.Application()
         app.router.add_get("/api/state", lambda _: web.json_response(scanner.snapshot()))
         app.router.add_get("/api/performance", lambda _: web.json_response({
-            "engine": "BES Flow A/B Challenger V2.4",
+            "engine": "BES Flow A/B Challenger V2.5",
             "records": scanner.performance_records[-2000:],
         }))
         app.router.add_get("/health", lambda _: web.json_response({"ok": scanner.connected, "markets": len(scanner.coins)}))
