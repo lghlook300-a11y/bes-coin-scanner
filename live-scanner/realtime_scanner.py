@@ -112,6 +112,17 @@ class Coin:
     abc_c_price: float | None = None
     abc_updated_at: int = 0
     abc_reason: str = "PRE-A 탐색 중"
+    confirm_price: float | None = None
+    confirm_at: int | None = None
+    confirm_a_price: float | None = None
+    confirm_b_price: float | None = None
+    confirm_c_price: float | None = None
+    entry_cycle_state: str = ""
+    entry_attempt_count: int = 0
+    entry_attempt_price: float | None = None
+    entry_stop_price: float | None = None
+    entry_stopped_at: int | None = None
+    entry_cycle_reason: str = "CONFIRM 구조 대기"
 
 
 def pct(new: float, old: float) -> float:
@@ -208,6 +219,75 @@ def analyze_fast_a_context(candles: list[dict[str, Any]], current_price: float) 
     detected = near_new_low and decline <= 0.5 and slowing and 0.0 <= recovery <= 5.0
     return {"candidate": detected, "price": candidate_price,
             "reason": "4H 새 저점 부근·하락 둔화" if detected else "PRE-A 조건 대기"}
+
+
+def analyze_pine_h4_bull(candles: list[dict[str, Any]], pivot_bars: int = 12,
+                         structural_lookback: int = 360, rearm_bars: int = 72) -> dict[str, Any]:
+    """Replay the uploaded Pine 4H Bull A state machine on confirmed Bithumb candles."""
+    rows = sorted(candles, key=lambda item: str(item.get("candle_date_time_utc", "")))
+    if len(rows) < pivot_bars * 2 + 2:
+        return {"stage": "구조 대기", "a": None, "b": None, "c": None, "last_confirm": None}
+    # Bithumb includes the still-forming 4H candle; Pine transitions use confirmed closes.
+    rows = rows[:-1]
+    lows = [float(row["low_price"]) for row in rows]
+    highs = [float(row["high_price"]) for row in rows]
+    closes = [float(row["trade_price"]) for row in rows]
+    times = [str(row.get("candle_date_time_utc", "")) for row in rows]
+    wait_a, wait_b, wait_c, wait_break = range(4)
+    state = wait_a
+    a = b = c = None
+    a_index = b_index = c_index = None
+    last_break_index = None
+    last_confirm = None
+    for bar in range(len(rows)):
+        pivot_index = bar - pivot_bars
+        pivot_low = pivot_high = None
+        if pivot_index >= pivot_bars and pivot_index + pivot_bars < len(rows):
+            low = lows[pivot_index]
+            high = highs[pivot_index]
+            if low < min(lows[pivot_index - pivot_bars:pivot_index]) and low <= min(lows[pivot_index + 1:pivot_index + pivot_bars + 1]):
+                pivot_low = low
+            if high > max(highs[pivot_index - pivot_bars:pivot_index]) and high >= max(highs[pivot_index + 1:pivot_index + pivot_bars + 1]):
+                pivot_high = high
+        structural_low = False
+        if pivot_low is not None:
+            start = max(0, pivot_index - structural_lookback + 1)
+            structural_low = pivot_low <= min(lows[start:pivot_index + 1])
+        passes_rearm = last_break_index is None or pivot_index >= last_break_index + rearm_bars
+        if state in {wait_b, wait_c} and a is not None and closes[bar] < a:
+            state, a, b, c = wait_a, None, None, None
+            a_index = b_index = c_index = None
+        elif state == wait_a:
+            if structural_low and passes_rearm:
+                a, a_index, b, b_index, c, c_index = pivot_low, pivot_index, None, None, None, None
+                state = wait_b
+        elif state == wait_b:
+            if pivot_low is not None and pivot_index > int(a_index) and pivot_low < float(a):
+                a, a_index = pivot_low, pivot_index
+            elif pivot_high is not None and pivot_index > int(a_index):
+                b, b_index, state = pivot_high, pivot_index, wait_c
+        elif state == wait_c:
+            if pivot_low is not None and pivot_index > int(b_index) and pivot_low <= float(a):
+                a, a_index, b, b_index, c, c_index = pivot_low, pivot_index, None, None, None, None
+                state = wait_b
+            elif pivot_high is not None and pivot_index > int(b_index) and pivot_high > float(b):
+                b, b_index = pivot_high, pivot_index
+            elif pivot_low is not None and pivot_index > int(b_index) and pivot_low > float(a):
+                c, c_index, state = pivot_low, pivot_index, wait_break
+        elif state == wait_break:
+            if closes[bar] < float(a):
+                state, a, b, c = wait_a, None, None, None
+                a_index = b_index = c_index = None
+            elif closes[bar] > float(b):
+                last_confirm = {"a": a, "b": b, "c": c, "confirm_price": b,
+                                "confirm_close": closes[bar], "confirm_time": times[bar],
+                                "confirm_bar": bar}
+                last_break_index = bar
+                state, a, b, c = wait_a, None, None, None
+                a_index = b_index = c_index = None
+    stage = {wait_a: "구조 대기", wait_b: "PRE-A", wait_c: "B 진행", wait_break: "C 눌림 대기"}[state]
+    return {"stage": stage, "a": a, "b": b, "c": c, "last_confirm": last_confirm,
+            "bars_used": len(rows)}
 
 
 def metrics(coin: Coin, now: int, seconds: int) -> dict[str, float]:
@@ -780,6 +860,99 @@ class Scanner:
             if coin.abc_b_price and current >= coin.abc_b_price * 1.003:
                 self.set_abc_stage(coin, "ABC 확인", "C 방어 후 B 고점 돌파", now)
 
+    @staticmethod
+    def confirm_time_ms(value: str) -> int:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return int(parsed.timestamp() * 1000)
+        except (TypeError, ValueError):
+            return 0
+
+    def apply_pine_h4_structure(self, coin: Coin, structure: dict[str, Any], now: int) -> None:
+        active_stage = str(structure.get("stage", "구조 대기"))
+        if active_stage in {"PRE-A", "B 진행", "C 눌림 대기"}:
+            self.set_abc_stage(coin, active_stage, "Pine 4H Pivot 12 구조 추적", now)
+            coin.abc_a_price = structure.get("a")
+            coin.abc_b_price = structure.get("b")
+            coin.abc_c_price = structure.get("c")
+        confirmed = structure.get("last_confirm")
+        if not isinstance(confirmed, dict):
+            return
+        confirmed_at = self.confirm_time_ms(str(confirmed.get("confirm_time", "")))
+        if confirmed_at <= int(coin.confirm_at or 0):
+            return
+        coin.confirm_at = confirmed_at
+        coin.confirm_price = float(confirmed["confirm_price"])
+        coin.confirm_a_price = float(confirmed["a"])
+        coin.confirm_b_price = float(confirmed["b"])
+        coin.confirm_c_price = float(confirmed["c"])
+        coin.abc_stage = "ABC 확인"
+        coin.abc_a_price = coin.confirm_a_price
+        coin.abc_b_price = coin.confirm_b_price
+        coin.abc_c_price = coin.confirm_c_price
+        coin.abc_updated_at = confirmed_at
+        coin.abc_reason = "4H 종가 B 돌파·파란 CONFIRM"
+        coin.entry_cycle_state = "CONFIRM 재확인 대기"
+        coin.entry_attempt_count = 0
+        coin.entry_attempt_price = None
+        coin.entry_stop_price = None
+        coin.entry_stopped_at = None
+        coin.entry_cycle_reason = "CONFIRM 가격 눌림과 재수급 대기"
+
+    def update_confirm_entry(self, coin: Coin, row: dict[str, float], now: int) -> None:
+        price = float(row.get("price", 0.0))
+        confirm = float(coin.confirm_price or 0.0)
+        base = float(coin.confirm_a_price or 0.0)
+        if not price or not confirm or not base:
+            return
+        if price < base:
+            coin.entry_cycle_state = "구조 종료"
+            coin.entry_cycle_reason = "4H A 기준 저점 붕괴"
+            return
+        distance = pct(price, confirm)
+        if coin.entry_cycle_state == "추격 금지" and -2.0 <= distance <= 5.0:
+            coin.entry_cycle_state = "CONFIRM 재확인 대기"
+            coin.entry_cycle_reason = "과열 해소·CONFIRM 부근 재수급 대기"
+        if price > confirm * 1.15 and coin.entry_cycle_state not in {"첫 시도", "재진입"}:
+            coin.entry_cycle_state = "추격 금지"
+            coin.entry_cycle_reason = "CONFIRM 대비 15% 초과 상승"
+            return
+        if coin.entry_cycle_state in {"첫 시도", "재진입"} and coin.entry_stop_price:
+            if price <= coin.entry_stop_price:
+                coin.entry_cycle_state = "단기 실패"
+                coin.entry_stopped_at = now
+                coin.entry_cycle_reason = "단기 방어선 이탈·A 구조는 별도 확인"
+                return
+            if coin.entry_attempt_price and price >= coin.entry_attempt_price * 1.05:
+                coin.entry_cycle_state = "단기 성공"
+                coin.entry_cycle_reason = "시도 가격 대비 +5% 도달"
+                return
+        repeated = coin.flow_second_at is not None
+        buy_flow = row.get("buy_30s", 0.0) >= 0.52 and row.get("buy_1m", 0.0) >= 0.50
+        calm = row.get("change_3m", 0.0) < 3.0
+        support = max(float(coin.confirm_c_price or base), confirm * 0.97)
+        stop = support * 0.995
+        stop_distance = abs(pct(stop, price))
+        setup = -2.0 <= distance <= 5.0 and repeated and buy_flow and calm and stop_distance <= 5.0
+        if not setup:
+            return
+        if coin.entry_cycle_state == "CONFIRM 재확인 대기":
+            coin.entry_cycle_state = "첫 시도"
+            coin.entry_attempt_count = 1
+            coin.entry_attempt_price = price
+            coin.entry_stop_price = stop
+            coin.entry_cycle_reason = "CONFIRM 부근 방어·2차 수급 재유입"
+        elif (coin.entry_cycle_state == "단기 실패" and coin.entry_stopped_at
+              and coin.flow_first_at and coin.flow_first_at > coin.entry_stopped_at
+              and price >= confirm):
+            coin.entry_cycle_state = "재진입"
+            coin.entry_attempt_count += 1
+            coin.entry_attempt_price = price
+            coin.entry_stop_price = stop
+            coin.entry_cycle_reason = "단기 실패 후 CONFIRM 재회복·새 수급"
+
     async def refresh_a_context(self, coin: Coin) -> None:
         now = int(time.time() * 1000)
         if self.session is None or coin.market in self.a_refreshing or now - coin.a_checked_at < A_CONTEXT_REFRESH_MS:
@@ -787,19 +960,19 @@ class Scanner:
         self.a_refreshing.add(coin.market)
         try:
             async with self.session.get(f"{REST_API}/candles/minutes/240",
-                                        params={"market": coin.market, "count": 40}) as response:
+                                        params={"market": coin.market, "count": 200}) as response:
                 response.raise_for_status()
                 candles = await response.json()
             current = coin.ticks[-1].price if coin.ticks else 0.0
             context = analyze_a_context(candles, current)
-            fast_context = analyze_fast_a_context(candles, current)
+            pine_structure = analyze_pine_h4_bull(candles)
             coin.a_checked_at = now
             coin.a_near = bool(context["near"])
             coin.a_price = context["price"]
             coin.a_distance_percent = context["distance"]
             coin.a_defended = bool(context["defended"])
             coin.a_reason = str(context["reason"])
-            self.update_abc_context(coin, fast_context, context, current, now)
+            self.apply_pine_h4_structure(coin, pine_structure, now)
             signal_id = f"{coin.market}-{coin.flow_first_at}"
             record = next((item for item in reversed(self.performance_records)
                            if item.get("signal_id") == signal_id), None)
@@ -941,6 +1114,9 @@ class Scanner:
             "a_checked_at", "a_near", "a_price", "a_distance_percent", "a_defended", "a_reason",
             "abc_stage", "abc_cycle_id", "abc_a_price", "abc_b_price", "abc_c_price",
             "abc_updated_at", "abc_reason",
+            "confirm_price", "confirm_at", "confirm_a_price", "confirm_b_price", "confirm_c_price",
+            "entry_cycle_state", "entry_attempt_count", "entry_attempt_price", "entry_stop_price",
+            "entry_stopped_at", "entry_cycle_reason",
         )
         for code, values in saved.items():
             coin = self.coins.get(code)
@@ -996,6 +1172,17 @@ class Scanner:
                     "abc_c_price": coin.abc_c_price,
                     "abc_updated_at": coin.abc_updated_at,
                     "abc_reason": coin.abc_reason,
+                    "confirm_price": coin.confirm_price,
+                    "confirm_at": coin.confirm_at,
+                    "confirm_a_price": coin.confirm_a_price,
+                    "confirm_b_price": coin.confirm_b_price,
+                    "confirm_c_price": coin.confirm_c_price,
+                    "entry_cycle_state": coin.entry_cycle_state,
+                    "entry_attempt_count": coin.entry_attempt_count,
+                    "entry_attempt_price": coin.entry_attempt_price,
+                    "entry_stop_price": coin.entry_stop_price,
+                    "entry_stopped_at": coin.entry_stopped_at,
+                    "entry_cycle_reason": coin.entry_cycle_reason,
                 }
                 for code, coin in self.coins.items()
             }
@@ -1063,9 +1250,10 @@ class Scanner:
                 btc_row = self.latest.get("KRW-BTC", {})
                 btc_falling = float(btc_row.get("change_3m", 0.0)) <= -0.35 or float(btc_row.get("change_1m", 0.0)) <= -0.20
                 update_flow_sequence(coin, self.latest[code], now, btc_falling)
-                self.update_abc_live(coin, float(self.latest[code].get("price", 0.0)), now)
+                self.update_confirm_entry(coin, self.latest[code], now)
                 abc_tracking = coin.abc_stage in {"PRE-A", "A 방어", "A 확인", "B 진행", "C 눌림 대기"}
-                if (coin.flow_stage or abc_tracking) and now - coin.a_checked_at >= A_CONTEXT_REFRESH_MS:
+                confirm_tracking = coin.entry_cycle_state in {"CONFIRM 재확인 대기", "첫 시도", "단기 실패", "재진입"}
+                if (coin.flow_stage or abc_tracking or confirm_tracking) and now - coin.a_checked_at >= A_CONTEXT_REFRESH_MS:
                     asyncio.create_task(self.refresh_a_context(coin))
                 if coin.flow_stage != previous_flow_stage:
                     self.record_flow_transition(coin, previous_flow_stage, previous_first_at, self.latest[code], now)
@@ -1119,7 +1307,8 @@ class Scanner:
             abc_visible = bool(coin.abc_stage) and (
                 coin.abc_stage not in {"ABC 확인", "A 실패"} or now - coin.abc_updated_at <= 30 * 60_000
             )
-            if code not in self.latest or (not coin.flow_stage and not abc_visible):
+            confirm_visible = coin.entry_cycle_state in {"CONFIRM 재확인 대기", "첫 시도", "단기 실패", "재진입"}
+            if code not in self.latest or (not coin.flow_stage and not abc_visible and not confirm_visible):
                 continue
             row = public_coin(coin, self.latest[code])
             row["first_seen_at"] = coin.flow_first_at
@@ -1132,6 +1321,15 @@ class Scanner:
             row["invalidation_price"] = round(coin.flow_invalidation_price, 8) if coin.flow_invalidation_price else round(coin.flow_first_price * 0.97, 8) if coin.flow_first_price else None
             row["exit_reason"] = coin.flow_exit_reason
             row.update(trade_decision(coin, self.latest[code], btc_falling))
+            if coin.entry_cycle_state in {"첫 시도", "재진입"}:
+                row["action"] = "소액 시도 가능"
+                row["decision_reason"] = coin.entry_cycle_reason
+            elif coin.entry_cycle_state in {"추격 금지", "구조 종료"}:
+                row["action"] = "매수 금지"
+                row["decision_reason"] = coin.entry_cycle_reason
+            elif row["action"] in {"소액 시도 가능", "돌파 확인"}:
+                row["action"] = "기다림"
+                row["decision_reason"] = "4H 파란 CONFIRM 재확인 전"
             row["risk"] = "BTC 단기 하락" if btc_falling else "일반"
             row["stop_price_3pct"] = round(float(row["first_seen_price"]) * 0.97, 8) if row.get("first_seen_price") else None
             prices = [float(point[1]) for point in row.get("chart_prices", [])]
@@ -1140,50 +1338,48 @@ class Scanner:
             row.update({"abc_stage": coin.abc_stage or "PRE-A 탐색", "abc_reason": coin.abc_reason,
                         "abc_a_price": coin.abc_a_price, "abc_b_price": coin.abc_b_price,
                         "abc_c_price": coin.abc_c_price, "abc_updated_at_ms": coin.abc_updated_at})
+            row.update({"confirm_price": coin.confirm_price, "confirm_at_ms": coin.confirm_at,
+                        "confirm_a_price": coin.confirm_a_price, "confirm_b_price": coin.confirm_b_price,
+                        "confirm_c_price": coin.confirm_c_price,
+                        "confirm_distance": round(pct(float(row["current_price"]), coin.confirm_price), 3) if coin.confirm_price else None,
+                        "entry_cycle_state": coin.entry_cycle_state or "CONFIRM 구조 대기",
+                        "entry_attempt_count": coin.entry_attempt_count,
+                        "entry_attempt_price": coin.entry_attempt_price,
+                        "entry_stop_price": coin.entry_stop_price,
+                        "entry_cycle_reason": coin.entry_cycle_reason})
             rows.append(row)
         stage_order = {"돌파 확인": 0, "소액 시도 가능": 1, "기다림": 2, "매수 금지": 3}
         rows.sort(key=lambda row: (stage_order.get(row["action"], 9), -row["score"], -(row["first_seen_at"] or 0)))
-        abc_order = {"ABC 확인": 0, "C 눌림 대기": 1, "B 진행": 2,
-                     "A 확인": 3, "A 방어": 4, "PRE-A": 5}
         for row in rows:
             a_price = float(row.get("abc_a_price") or 0.0)
             current = float(row.get("current_price") or 0.0)
             a_distance = pct(current, a_price) if a_price and current else None
             row["abc_current_distance"] = round(a_distance, 3) if a_distance is not None else None
             stage = str(row.get("abc_stage", ""))
-            repeated_flow = row.get("flow_second_strength") is not None
-            buy_flow = float(row.get("buy_ratio_30s", 0.0)) >= 52.0 and float(row.get("buy_ratio_1m", 0.0)) >= 50.0
-            not_overheated = float(row.get("change_3m", 0.0)) < 3.0 and row.get("action") != "매수 금지"
-            rising_detection = row.get("daily_price_trend") != "포착가 하락형"
-            row["entry_review"] = bool(
-                a_distance is not None and 1.0 <= a_distance <= 4.0
-                and stage in {"A 방어", "A 확인", "C 눌림 대기"}
-                and repeated_flow and buy_flow and not_overheated and rising_detection
-            )
+            row["entry_review"] = row.get("entry_cycle_state") in {"첫 시도", "재진입"}
             if row["entry_review"]:
-                row["entry_review_reason"] = "A 1~4%·저점 방어·2차 수급·매수체결 우위"
-            elif stage in {"PRE-A", "A 방어"} and a_distance is not None and -1.0 <= a_distance <= 3.0:
-                row["entry_review_reason"] = "A 초기 관찰·추가 방어와 2차 수급 대기"
-            elif a_distance is not None and a_distance > 4.0:
-                row["entry_review_reason"] = "A에서 4% 초과·추격 주의"
+                row["entry_review_reason"] = row.get("entry_cycle_reason")
+            elif row.get("entry_cycle_state") == "CONFIRM 재확인 대기":
+                row["entry_review_reason"] = "파란 CONFIRM 가격 눌림·재수급 대기"
+            elif row.get("entry_cycle_state") == "단기 실패":
+                row["entry_review_reason"] = "A 유지 시 CONFIRM 재회복·새 수급 대기"
             else:
-                row["entry_review_reason"] = "조건 재확인 필요"
+                row["entry_review_reason"] = row.get("entry_cycle_reason", "조건 재확인 필요")
         entry_review = [row for row in rows if row.get("entry_review")]
         entry_review.sort(key=lambda row: (
-            {"C 눌림 대기": 0, "A 확인": 1, "A 방어": 2}.get(row.get("abc_stage"), 9),
-            -int(row.get("daily_a_defense_count", 0)), -int(row.get("score", 0))))
+            {"재진입": 0, "첫 시도": 1}.get(row.get("entry_cycle_state"), 9),
+            -int(row.get("score", 0))))
         a_tracking = [row for row in rows if not row.get("entry_review")
-                      and row.get("abc_stage") in {"PRE-A", "A 방어"}
-                      and row.get("abc_current_distance") is not None
-                      and -1.0 <= float(row["abc_current_distance"]) <= 3.0]
+                      and (row.get("abc_stage") in {"PRE-A", "B 진행", "C 눌림 대기"}
+                           or row.get("entry_cycle_state") in {"CONFIRM 재확인 대기", "단기 실패"})]
         a_tracking.sort(key=lambda row: (
-            {"A 방어": 0, "PRE-A": 1}[row["abc_stage"]],
-            -int(row.get("daily_a_defense_count", 0)),
+            {"단기 실패": 0, "CONFIRM 재확인 대기": 1}.get(row.get("entry_cycle_state"),
+                {"C 눌림 대기": 2, "B 진행": 3, "PRE-A": 4}.get(row.get("abc_stage"), 9)),
             -int(row.get("daily_pre_a_count", 0)),
             -int(row.get("score", 0)),
         ))
         return {
-            "engine": "BES Flow A/B Challenger V2.7",
+            "engine": "BES Flow CONFIRM Re-entry V2.8",
             "connected": self.connected,
             "updated_at_ms": self.updated_at,
             "market_count": len(self.coins),
@@ -1211,7 +1407,7 @@ async def main() -> None:
         app = web.Application()
         app.router.add_get("/api/state", lambda _: web.json_response(scanner.snapshot()))
         app.router.add_get("/api/performance", lambda _: web.json_response({
-            "engine": "BES Flow A/B Challenger V2.7",
+            "engine": "BES Flow CONFIRM Re-entry V2.8",
             "records": scanner.performance_records[-2000:],
         }))
         app.router.add_get("/health", lambda _: web.json_response({"ok": scanner.connected, "markets": len(scanner.coins)}))
