@@ -23,6 +23,7 @@ DATA_DIR = Path(os.environ.get("BES_DATA_DIR", "data-live"))
 STATE_FILE = DATA_DIR / "scanner_state.json"
 EVENT_FILE = DATA_DIR / "events.jsonl"
 PERFORMANCE_FILE = DATA_DIR / "flow_performance.json"
+CONFIRM_PERFORMANCE_FILE = DATA_DIR / "confirm_performance_v2_9.json"
 DAILY_COUNT_FILE = DATA_DIR / "daily_detection_counts_v2_5.json"
 STATIC_DIR = Path(__file__).with_name("static")
 STABLE = {"USDT", "USDC", "DAI", "TUSD", "FDUSD", "USDE", "PYUSD"}
@@ -683,6 +684,7 @@ class Scanner:
         self.connected = False
         self.updated_at = 0
         self.performance_records = self.load_performance()
+        self.confirm_performance_records, self.confirm_stage_events = self.load_confirm_performance()
         self.daily_counts = self.load_daily_counts()
         self.session: ClientSession | None = None
         self.a_refreshing: set[str] = set()
@@ -801,6 +803,7 @@ class Scanner:
         coin.abc_stage = stage
         coin.abc_reason = reason
         coin.abc_updated_at = now
+        self.record_confirm_stage(coin, stage, reason, now)
         if stage == "PRE-A":
             self.count_stage_once(coin, now, "pre_a")
         elif stage == "A 방어":
@@ -873,10 +876,10 @@ class Scanner:
     def apply_pine_h4_structure(self, coin: Coin, structure: dict[str, Any], now: int) -> None:
         active_stage = str(structure.get("stage", "구조 대기"))
         if active_stage in {"PRE-A", "B 진행", "C 눌림 대기"}:
-            self.set_abc_stage(coin, active_stage, "Pine 4H Pivot 12 구조 추적", now)
             coin.abc_a_price = structure.get("a")
             coin.abc_b_price = structure.get("b")
             coin.abc_c_price = structure.get("c")
+            self.set_abc_stage(coin, active_stage, "Pine 4H Pivot 12 구조 추적", now)
         confirmed = structure.get("last_confirm")
         if not isinstance(confirmed, dict):
             return
@@ -900,6 +903,8 @@ class Scanner:
         coin.entry_stop_price = None
         coin.entry_stopped_at = None
         coin.entry_cycle_reason = "CONFIRM 가격 눌림과 재수급 대기"
+        self.record_confirm_stage(coin, "ABC 확인", "4H 종가 B 돌파·파란 CONFIRM", confirmed_at)
+        self.start_confirm_performance(coin)
 
     def update_confirm_entry(self, coin: Coin, row: dict[str, float], now: int) -> None:
         price = float(row.get("price", 0.0))
@@ -996,6 +1001,130 @@ class Scanner:
             return rows if isinstance(rows, list) else []
         except (OSError, ValueError):
             return []
+
+    def load_confirm_performance(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        try:
+            data = json.loads(CONFIRM_PERFORMANCE_FILE.read_text(encoding="utf-8"))
+            records = data.get("records", []) if isinstance(data, dict) else []
+            events = data.get("stage_events", []) if isinstance(data, dict) else []
+            return (records if isinstance(records, list) else [],
+                    events if isinstance(events, list) else [])
+        except (OSError, ValueError):
+            return [], []
+
+    def record_confirm_stage(self, coin: Coin, stage: str, reason: str, now: int) -> None:
+        price = coin.ticks[-1].price if coin.ticks else None
+        self.confirm_stage_events.append({
+            "at_ms": now, "market": coin.market, "symbol": coin.market.split("-", 1)[1],
+            "stage": stage, "reason": reason, "price": price,
+            "a_price": coin.abc_a_price, "b_price": coin.abc_b_price, "c_price": coin.abc_c_price,
+        })
+        self.confirm_stage_events = self.confirm_stage_events[-5000:]
+
+    def start_confirm_performance(self, coin: Coin) -> None:
+        if not coin.confirm_at or not coin.confirm_price:
+            return
+        record_id = f"{coin.market}-{coin.confirm_at}"
+        if any(item.get("record_id") == record_id for item in self.confirm_performance_records):
+            return
+        self.confirm_performance_records.append({
+            "record_id": record_id, "engine": "BES Flow CONFIRM Re-entry V2.9",
+            "market": coin.market, "symbol": coin.market.split("-", 1)[1],
+            "confirm_at_ms": coin.confirm_at, "confirm_price": coin.confirm_price,
+            "a_price": coin.confirm_a_price, "b_price": coin.confirm_b_price,
+            "c_price": coin.confirm_c_price, "status": "CONFIRM 재확인 대기",
+            "attempts": [], "entry_events": [], "price_samples": [],
+        })
+        self.confirm_performance_records = self.confirm_performance_records[-2000:]
+
+    def active_confirm_record(self, coin: Coin) -> dict[str, Any] | None:
+        record_id = f"{coin.market}-{coin.confirm_at}" if coin.confirm_at else ""
+        return next((item for item in reversed(self.confirm_performance_records)
+                     if item.get("record_id") == record_id), None)
+
+    def record_confirm_entry_transition(self, coin: Coin, previous: str, now: int, price: float) -> None:
+        record = self.active_confirm_record(coin)
+        if record is None:
+            return
+        state = coin.entry_cycle_state
+        record["status"] = state
+        record.setdefault("entry_events", []).append({
+            "at_ms": now, "from": previous or "CONFIRM 구조 대기", "to": state,
+            "price": price, "reason": coin.entry_cycle_reason,
+        })
+        if state in {"첫 시도", "재진입"}:
+            record.setdefault("attempts", []).append({
+                "attempt_number": coin.entry_attempt_count, "type": state,
+                "entry_at_ms": now, "entry_price": coin.entry_attempt_price,
+                "stop_price": coin.entry_stop_price, "status": "진행 중",
+                "current_return": 0.0, "peak_return": 0.0, "mae": 0.0,
+                "threshold_events": [], "price_samples": [], "last_sample_at_ms": 0,
+            })
+        elif state == "단기 실패" and record.get("attempts"):
+            attempt = record["attempts"][-1]
+            attempt["lifecycle_status"] = "전용 손절"
+            attempt["stopped_at_ms"] = now
+            attempt["stopped_price"] = price
+        elif state == "단기 성공" and record.get("attempts"):
+            record["attempts"][-1]["lifecycle_status"] = "단기 +5%"
+
+    def update_confirm_performance(self, coin: Coin, now: int, price: float) -> None:
+        record = self.active_confirm_record(coin)
+        if record is None:
+            return
+        if not record.get("price_samples") or now - int(record.get("last_sample_at_ms", 0)) >= 60_000:
+            record.setdefault("price_samples", []).append([now, price])
+            record["price_samples"] = record["price_samples"][-720:]
+            record["last_sample_at_ms"] = now
+        attempts = record.get("attempts", [])
+        if not attempts:
+            return
+        for attempt in attempts:
+            if attempt.get("status") in {"성공", "실패"}:
+                continue
+            entry_at = int(attempt.get("entry_at_ms", 0))
+            entry_price = float(attempt.get("entry_price") or 0.0)
+            if not entry_at or not entry_price:
+                continue
+            ret = pct(price, entry_price)
+            attempt["current_return"] = round(ret, 4)
+            attempt["peak_return"] = round(max(float(attempt.get("peak_return", 0.0)), ret), 4)
+            attempt["mae"] = round(min(float(attempt.get("mae", 0.0)), ret), 4)
+            if not attempt.get("price_samples") or now - int(attempt.get("last_sample_at_ms", 0)) >= 60_000:
+                attempt.setdefault("price_samples", []).append([now, price])
+                attempt["price_samples"] = attempt["price_samples"][-720:]
+                attempt["last_sample_at_ms"] = now
+            if ret >= 10.0:
+                attempt["status"] = "성공"
+                attempt["completed_at_ms"] = now
+                attempt["threshold_events"].append({"at_ms": now, "threshold": "+10%", "price": price})
+            elif ret <= -5.0:
+                attempt["status"] = "실패"
+                attempt["completed_at_ms"] = now
+                attempt["threshold_events"].append({"at_ms": now, "threshold": "-5%", "price": price})
+            elif now - entry_at >= 12 * 60 * 60_000:
+                attempt["status"] = "실패"
+                attempt["completed_at_ms"] = now
+                attempt["threshold_events"].append({"at_ms": now, "threshold": "12시간 미도달", "price": price})
+
+    def confirm_performance_summary(self) -> dict[str, Any]:
+        attempts = [attempt for record in self.confirm_performance_records
+                    for attempt in record.get("attempts", [])]
+        success = sum(attempt.get("status") == "성공" for attempt in attempts)
+        failure = sum(attempt.get("status") == "실패" for attempt in attempts)
+        ongoing = sum(attempt.get("status") == "진행 중" for attempt in attempts)
+        by_type = {}
+        for kind in ("첫 시도", "재진입"):
+            rows = [attempt for attempt in attempts if attempt.get("type") == kind]
+            won = sum(attempt.get("status") == "성공" for attempt in rows)
+            lost = sum(attempt.get("status") == "실패" for attempt in rows)
+            by_type[kind] = {"success": won, "failure": lost,
+                             "ongoing": sum(attempt.get("status") == "진행 중" for attempt in rows),
+                             "win_rate_percent": round(won / (won + lost) * 100, 2) if won + lost else None}
+        return {"success": success, "failure": failure, "ongoing": ongoing,
+                "win_rate_percent": round(success / (success + failure) * 100, 2) if success + failure else None,
+                "by_type": by_type,
+                "rule": "+10% within 12h = success; -5% first or no +10% within 12h = failure"}
 
     def record_flow_transition(self, coin: Coin, previous: str, previous_first_at: int | None,
                                row: dict[str, float], now: int) -> None:
@@ -1192,6 +1321,15 @@ class Scanner:
             performance_tmp = PERFORMANCE_FILE.with_suffix(".tmp")
             performance_tmp.write_text(json.dumps(self.performance_records[-2000:], ensure_ascii=False), encoding="utf-8")
             performance_tmp.replace(PERFORMANCE_FILE)
+            confirm_tmp = CONFIRM_PERFORMANCE_FILE.with_suffix(".tmp")
+            confirm_tmp.write_text(json.dumps({
+                "engine": "BES Flow CONFIRM Re-entry V2.9",
+                "rule": "+10% within 12h = success; -5% first or no +10% within 12h = failure",
+                "summary": self.confirm_performance_summary(),
+                "stage_events": self.confirm_stage_events[-5000:],
+                "records": self.confirm_performance_records[-2000:],
+            }, ensure_ascii=False), encoding="utf-8")
+            confirm_tmp.replace(CONFIRM_PERFORMANCE_FILE)
             # Keep date-based counts separately; a new KST date naturally starts at zero.
             recent_days = sorted(self.daily_counts)[-90:]
             daily_tmp = DAILY_COUNT_FILE.with_suffix(".tmp")
@@ -1250,7 +1388,12 @@ class Scanner:
                 btc_row = self.latest.get("KRW-BTC", {})
                 btc_falling = float(btc_row.get("change_3m", 0.0)) <= -0.35 or float(btc_row.get("change_1m", 0.0)) <= -0.20
                 update_flow_sequence(coin, self.latest[code], now, btc_falling)
+                previous_entry_state = coin.entry_cycle_state
                 self.update_confirm_entry(coin, self.latest[code], now)
+                current_price = float(self.latest[code].get("price", 0.0))
+                if coin.entry_cycle_state != previous_entry_state:
+                    self.record_confirm_entry_transition(coin, previous_entry_state, now, current_price)
+                self.update_confirm_performance(coin, now, current_price)
                 abc_tracking = coin.abc_stage in {"PRE-A", "A 방어", "A 확인", "B 진행", "C 눌림 대기"}
                 confirm_tracking = coin.entry_cycle_state in {"CONFIRM 재확인 대기", "첫 시도", "단기 실패", "재진입"}
                 if (coin.flow_stage or abc_tracking or confirm_tracking) and now - coin.a_checked_at >= A_CONTEXT_REFRESH_MS:
@@ -1379,7 +1522,7 @@ class Scanner:
             -int(row.get("score", 0)),
         ))
         return {
-            "engine": "BES Flow CONFIRM Re-entry V2.8",
+            "engine": "BES Flow CONFIRM Re-entry V2.9",
             "connected": self.connected,
             "updated_at_ms": self.updated_at,
             "market_count": len(self.coins),
@@ -1391,6 +1534,7 @@ class Scanner:
             "results": rows,
             "events": self.events[-100:],
             "performance_records": self.performance_records[-200:],
+            "confirm_performance_summary": self.confirm_performance_summary(),
             "counting_window": {"start_at_ms": session_start, "end_at_ms": session_end,
                                 "label": "매일 오전 9시 ~ 다음 날 오전 9시 (KST)"},
             "top_detection_counts": self.top_daily_counts(now),
@@ -1407,8 +1551,14 @@ async def main() -> None:
         app = web.Application()
         app.router.add_get("/api/state", lambda _: web.json_response(scanner.snapshot()))
         app.router.add_get("/api/performance", lambda _: web.json_response({
-            "engine": "BES Flow CONFIRM Re-entry V2.8",
+            "engine": "BES Flow CONFIRM Re-entry V2.9",
             "records": scanner.performance_records[-2000:],
+        }))
+        app.router.add_get("/api/confirm-performance", lambda _: web.json_response({
+            "engine": "BES Flow CONFIRM Re-entry V2.9",
+            "summary": scanner.confirm_performance_summary(),
+            "stage_events": scanner.confirm_stage_events[-5000:],
+            "records": scanner.confirm_performance_records[-2000:],
         }))
         app.router.add_get("/health", lambda _: web.json_response({"ok": scanner.connected, "markets": len(scanner.coins)}))
         app.router.add_static("/", STATIC_DIR, show_index=True)
