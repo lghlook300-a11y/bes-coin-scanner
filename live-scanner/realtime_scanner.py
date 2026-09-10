@@ -24,7 +24,7 @@ STATE_FILE = DATA_DIR / "scanner_state.json"
 EVENT_FILE = DATA_DIR / "events.jsonl"
 PERFORMANCE_FILE = DATA_DIR / "flow_performance.json"
 CONFIRM_PERFORMANCE_FILE = DATA_DIR / "confirm_performance_v2_9.json"
-ENTRY_PERFORMANCE_FILE = DATA_DIR / "entry_performance_v3_1.json"
+ENTRY_PERFORMANCE_FILE = DATA_DIR / "entry_performance_v3_0.json"
 DAILY_COUNT_FILE = DATA_DIR / "daily_detection_counts_v2_5.json"
 STATIC_DIR = Path(__file__).with_name("static")
 STABLE = {"USDT", "USDC", "DAI", "TUSD", "FDUSD", "USDE", "PYUSD"}
@@ -516,6 +516,38 @@ def trade_decision(coin: Coin, row: dict[str, float], btc_falling: bool = False)
         "a_distance_percent": round(coin.a_distance_percent, 2) if coin.a_distance_percent is not None else None,
         "a_defended": coin.a_defended,
         "a_reason": coin.a_reason,
+    }
+
+
+def early_a_decision(coin: Coin, row: dict[str, float], btc_falling: bool = False) -> dict[str, Any]:
+    """Strict A-near probe. This is an early, small-risk setup—not an ABC confirmation."""
+    price = float(row.get("price", 0.0))
+    a_price = float(coin.abc_a_price or coin.a_price or 0.0)
+    if not price or not a_price:
+        return {"eligible": False, "reason": "A 가격 확인 전"}
+    distance = pct(price, a_price)
+    repeated = coin.flow_second_at is not None
+    buy_flow = row.get("buy_30s", 0.0) >= 0.54 and row.get("buy_1m", 0.0) >= 0.51
+    calm = row.get("change_3m", 0.0) < 3.0 and row.get("change_1m", 0.0) < 2.0
+    stage_ok = coin.abc_stage in {"A 방어", "A 확인"}
+    stop = a_price * 0.99
+    stop_distance = abs(pct(stop, price))
+    not_chasing = distance <= 3.0 and pct(price, float(coin.flow_first_price or price)) < 6.0
+    eligible = bool(stage_ok and 0.0 <= distance <= 3.0 and repeated and buy_flow and calm
+                    and stop_distance <= 4.0 and not btc_falling and not_chasing)
+    missing = []
+    if not stage_ok: missing.append("A 방어 미확인")
+    if not 0.0 <= distance <= 3.0: missing.append("A 거리 3% 초과")
+    if not repeated: missing.append("2차 수급 미확인")
+    if not buy_flow: missing.append("매수 우세 부족")
+    if not calm: missing.append("단기 과열")
+    if btc_falling: missing.append("BTC 약세")
+    return {
+        "eligible": eligible,
+        "reason": "A 3% 이내·저점 방어·2차 수급·매수 우세" if eligible else " · ".join(missing[:3]),
+        "entry_price": price,
+        "stop_price": round(stop, 8),
+        "distance": round(distance, 3),
     }
 
 
@@ -1028,7 +1060,7 @@ class Scanner:
         if not price or any(row.get("record_id") == record_id for row in self.entry_performance_records):
             return
         self.entry_performance_records.append({
-            "record_id": record_id, "engine": "BES V2.9 Capture + Performance V3.1",
+            "record_id": record_id, "engine": "BES Entry Comparator V3.0",
             "market": coin.market, "symbol": coin.market.split("-", 1)[1], "type": kind,
             "entry_at_ms": now, "entry_price": price, "stop_price": stop_price,
             "status": "진행 중", "current_return": 0.0, "peak_return": 0.0, "mae": 0.0,
@@ -1061,7 +1093,7 @@ class Scanner:
 
     def entry_performance_summary(self) -> dict[str, Any]:
         by_type = {}
-        for kind in ("기존 수급", "A+ 조기 포착", "CONFIRM 2차"):
+        for kind in ("기존 수급", "A 초기 시도", "CONFIRM 2차"):
             rows = [row for row in self.entry_performance_records if row.get("type") == kind]
             won = sum(row.get("status") == "성공" for row in rows)
             lost = sum(row.get("status") == "실패" for row in rows)
@@ -1397,7 +1429,7 @@ class Scanner:
             confirm_tmp.replace(CONFIRM_PERFORMANCE_FILE)
             entry_tmp = ENTRY_PERFORMANCE_FILE.with_suffix(".tmp")
             entry_tmp.write_text(json.dumps({
-                "engine": "BES V2.9 Capture + Performance V3.1",
+                "engine": "BES Entry Comparator V3.0",
                 "summary": self.entry_performance_summary(),
                 "records": self.entry_performance_records[-5000:],
             }, ensure_ascii=False), encoding="utf-8")
@@ -1480,12 +1512,10 @@ class Scanner:
                     self.register_entry_performance(
                         coin, "기존 수급", now, current_price,
                         decision.get("decision_stop_price"), str(coin.flow_first_at or now))
-                # Preserve V2.9's broad/early A capture. This is measured as a watch
-                # signal and never promoted to the buy-review panel by itself.
-                if (coin.a_near or coin.abc_stage in {"PRE-A", "A 방어", "A 확인"}) and coin.flow_second_at:
+                early = early_a_decision(coin, self.latest[code], btc_falling)
+                if early.get("eligible"):
                     self.register_entry_performance(
-                        coin, "A+ 조기 포착", now, current_price,
-                        (float(coin.abc_a_price or coin.a_price or 0.0) * 0.99) or None,
+                        coin, "A 초기 시도", now, current_price, early.get("stop_price"),
                         str(coin.abc_cycle_id or coin.flow_first_at or now))
                 if event:
                     self.events.append(event)
@@ -1549,6 +1579,7 @@ class Scanner:
             row["invalidation_price"] = round(coin.flow_invalidation_price, 8) if coin.flow_invalidation_price else round(coin.flow_first_price * 0.97, 8) if coin.flow_first_price else None
             row["exit_reason"] = coin.flow_exit_reason
             row.update(trade_decision(coin, self.latest[code], btc_falling))
+            early_a = early_a_decision(coin, self.latest[code], btc_falling)
             if coin.entry_cycle_state in {"첫 시도", "재진입"}:
                 row["action"] = "소액 시도 가능"
                 row["decision_reason"] = coin.entry_cycle_reason
@@ -1556,8 +1587,14 @@ class Scanner:
                 row["action"] = "매수 금지"
                 row["decision_reason"] = coin.entry_cycle_reason
             elif row["action"] in {"소액 시도 가능", "돌파 확인"}:
-                row["action"] = "기다림"
-                row["decision_reason"] = "4H 파란 CONFIRM 재확인 전"
+                if early_a.get("eligible"):
+                    row["action"] = "소액 시도 가능"
+                    row["decision_reason"] = "A 초기 시도 · " + str(early_a.get("reason"))
+                    row["decision_stop_price"] = early_a.get("stop_price")
+                    row["entry_signal_type"] = "A 초기 시도"
+                else:
+                    row["action"] = "기다림"
+                    row["decision_reason"] = "A 초기 조건 또는 4H 파란 CONFIRM 재확인 전"
             row["risk"] = "BTC 단기 하락" if btc_falling else "일반"
             row["stop_price_3pct"] = round(float(row["first_seen_price"]) * 0.97, 8) if row.get("first_seen_price") else None
             prices = [float(point[1]) for point in row.get("chart_prices", [])]
@@ -1575,7 +1612,10 @@ class Scanner:
                         "entry_attempt_price": coin.entry_attempt_price,
                         "entry_stop_price": coin.entry_stop_price,
                         "entry_cycle_reason": coin.entry_cycle_reason,
-                        "entry_signal_type": "CONFIRM 2차" if coin.entry_cycle_state in {"첫 시도", "재진입"} else None})
+                        "entry_signal_type": row.get("entry_signal_type") or (
+                            "CONFIRM 2차" if coin.entry_cycle_state in {"첫 시도", "재진입"}
+                            else "기존 수급" if row.get("action") in {"소액 시도 가능", "돌파 확인"}
+                            else None)})
             rows.append(row)
         stage_order = {"돌파 확인": 0, "소액 시도 가능": 1, "기다림": 2, "매수 금지": 3}
         rows.sort(key=lambda row: (stage_order.get(row["action"], 9), -row["score"], -(row["first_seen_at"] or 0)))
@@ -1585,9 +1625,12 @@ class Scanner:
             a_distance = pct(current, a_price) if a_price and current else None
             row["abc_current_distance"] = round(a_distance, 3) if a_distance is not None else None
             stage = str(row.get("abc_stage", ""))
-            row["entry_review"] = row.get("entry_cycle_state") in {"첫 시도", "재진입"}
+            row["entry_review"] = (row.get("entry_cycle_state") in {"첫 시도", "재진입"}
+                                   or row.get("entry_signal_type") == "A 초기 시도")
             if row["entry_review"]:
                 row["entry_review_reason"] = row.get("entry_cycle_reason")
+                if row.get("entry_signal_type") == "A 초기 시도":
+                    row["entry_review_reason"] = row.get("decision_reason")
             elif row.get("entry_cycle_state") == "CONFIRM 재확인 대기":
                 row["entry_review_reason"] = "파란 CONFIRM 가격 눌림·재수급 대기"
             elif row.get("entry_cycle_state") == "단기 실패":
@@ -1607,13 +1650,8 @@ class Scanner:
             -int(row.get("daily_pre_a_count", 0)),
             -int(row.get("score", 0)),
         ))
-        early_watch = [row for row in rows if row.get("abc_stage") in {"PRE-A", "A 방어", "A 확인"}]
-        early_watch.sort(key=lambda row: (
-            {"A 확인": 0, "A 방어": 1, "PRE-A": 2}.get(row.get("abc_stage"), 9),
-            abs(float(row.get("abc_current_distance") or 999.0)),
-            -int(row.get("daily_second_count", 0)), -int(row.get("score", 0))))
         return {
-            "engine": "BES V2.9 Capture + Performance V3.1",
+            "engine": "BES Flow CONFIRM Re-entry V2.9",
             "connected": self.connected,
             "updated_at_ms": self.updated_at,
             "market_count": len(self.coins),
@@ -1631,7 +1669,6 @@ class Scanner:
                                 "label": "매일 오전 9시 ~ 다음 날 오전 9시 (KST)"},
             "top_detection_counts": self.top_daily_counts(now),
             "entry_review_results": entry_review[:3],
-            "early_watch_results": early_watch[:10],
             "a_tracking_results": a_tracking[:5],
             "daily_counts": self.daily_counts.get(kst_session_date(now), {}),
         }
@@ -1654,7 +1691,7 @@ async def main() -> None:
             "records": scanner.confirm_performance_records[-2000:],
         }))
         app.router.add_get("/api/entry-performance", lambda _: web.json_response({
-            "engine": "BES V2.9 Capture + Performance V3.1",
+            "engine": "BES Entry Comparator V3.0",
             "summary": scanner.entry_performance_summary(),
             "records": scanner.entry_performance_records[-5000:],
         }))
