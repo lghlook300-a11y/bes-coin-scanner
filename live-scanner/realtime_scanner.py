@@ -25,6 +25,7 @@ EVENT_FILE = DATA_DIR / "events.jsonl"
 PERFORMANCE_FILE = DATA_DIR / "flow_performance.json"
 DAILY_COUNT_FILE = DATA_DIR / "daily_detection_counts_v2_5.json"
 DAILY_HISTORY_FILE = DATA_DIR / "daily_history_v2_8.json"
+EARLY_RADAR_FILE = DATA_DIR / "early_bottom_radar_v2_8.json"
 STATIC_DIR = Path(__file__).with_name("static")
 STABLE = {"USDT", "USDC", "DAI", "TUSD", "FDUSD", "USDE", "PYUSD"}
 STATE_CONFIRM_MS = {
@@ -41,6 +42,8 @@ CHART_WINDOW_MS = 3 * 60_000
 CHART_BUCKET_MS = 5_000
 CANDIDATE_HOLD_MS = 3 * 60_000
 A_CONTEXT_REFRESH_MS = 5 * 60_000
+EARLY_RADAR_REFRESH_MS = 15 * 60_000
+EARLY_RADAR_REDETECTION_MS = 12 * 60 * 60_000
 REDETECTION_GAP_MS = 30 * 60_000
 STATE_STRENGTH = {"일반 감시": 0, "관찰 유지": 1, "수급 유입": 2, "상승 가능": 3}
 
@@ -124,6 +127,19 @@ class Coin:
     entry_stop_price: float | None = None
     entry_stopped_at: int | None = None
     entry_cycle_reason: str = "CONFIRM 구조 대기"
+    radar_checked_at: int = 0
+    radar_score: int = 0
+    radar_stage: str = ""
+    radar_reason: str = "바닥 구조 확인 전"
+    radar_first_at: int | None = None
+    radar_first_price: float | None = None
+    radar_l1_price: float | None = None
+    radar_l2_price: float | None = None
+    radar_atr_percent: float | None = None
+    radar_obv_divergence: bool = False
+    radar_volume_contraction: bool = False
+    radar_ema_recovered: bool = False
+    radar_breakout_ready: bool = False
 
 
 def pct(new: float, old: float) -> float:
@@ -220,6 +236,92 @@ def analyze_fast_a_context(candles: list[dict[str, Any]], current_price: float) 
     detected = near_new_low and decline <= 0.5 and slowing and 0.0 <= recovery <= 5.0
     return {"candidate": detected, "price": candidate_price,
             "reason": "4H 새 저점 부근·하락 둔화" if detected else "PRE-A 조건 대기"}
+
+
+def analyze_early_bottom_radar(candles: list[dict[str, Any]], current_price: float) -> dict[str, Any]:
+    """Non-trading shadow detector for a defended/higher 4H low before flow confirmation."""
+    rows = sorted(candles, key=lambda item: str(item.get("candle_date_time_utc", "")))
+    if len(rows) < 36 or current_price <= 0:
+        return {"score": 0, "stage": "", "reason": "4시간봉 자료 부족"}
+    # The newest Bithumb candle is still forming.  Use it only as the live price.
+    rows = rows[:-1]
+    highs = [float(row["high_price"]) for row in rows]
+    lows = [float(row["low_price"]) for row in rows]
+    closes = [float(row["trade_price"]) for row in rows]
+    volumes = [float(row.get("candle_acc_trade_volume", 0.0)) for row in rows]
+    true_ranges = []
+    for i in range(1, len(rows)):
+        true_ranges.append(max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]),
+                               abs(lows[i] - closes[i - 1])))
+    atr = sum(true_ranges[-14:]) / max(1, len(true_ranges[-14:]))
+    atr_percent = pct(closes[-1] + atr, closes[-1]) if closes[-1] else 0.0
+
+    start = max(2, len(rows) - 42)
+    pivots = [i for i in range(start, len(rows) - 2)
+              if lows[i] <= min(lows[i - 2:i]) and lows[i] <= min(lows[i + 1:i + 3])]
+    pair = None
+    for right_pos in range(len(pivots) - 1, 0, -1):
+        l2_index = pivots[right_pos]
+        for left_pos in range(right_pos - 1, -1, -1):
+            l1_index = pivots[left_pos]
+            if l2_index - l1_index < 3:
+                continue
+            tolerance = max(lows[l1_index] * 0.025, atr * 0.55)
+            if lows[l2_index] >= lows[l1_index] - tolerance and lows[l2_index] <= lows[l1_index] * 1.10:
+                pair = (l1_index, l2_index)
+                break
+        if pair:
+            break
+    if pair is None:
+        return {"score": 0, "stage": "", "reason": "방어된 두 번째 저점 대기",
+                "atr_percent": round(atr_percent, 3)}
+
+    l1_index, l2_index = pair
+    l1, l2 = lows[l1_index], lows[l2_index]
+    higher_low = l2 >= l1 or l2 >= l1 - max(l1 * 0.012, atr * 0.35)
+    first_volume = max(volumes[l1_index], 1e-12)
+    volume_contraction = volumes[l2_index] <= first_volume * 0.85
+
+    obv = [0.0]
+    for i in range(1, len(rows)):
+        direction = 1.0 if closes[i] > closes[i - 1] else -1.0 if closes[i] < closes[i - 1] else 0.0
+        obv.append(obv[-1] + direction * volumes[i])
+    obv_divergence = l2 <= l1 * 1.04 and obv[l2_index] > obv[l1_index]
+    ema20 = ema(closes[-20:], 20)
+    ema_recovered = current_price >= ema20 * 0.985
+    between_high = max(highs[l1_index + 1:l2_index]) if l2_index > l1_index + 1 else highs[l1_index]
+    breakout_ready = current_price >= between_high * 0.985
+    recent_volume = sum(volumes[-3:]) / 3.0
+    base_volume = sum(volumes[-20:-3]) / max(1, len(volumes[-20:-3]))
+    volume_reentry = recent_volume >= base_volume * 1.20
+
+    score = 25
+    score += 10 if higher_low else 0
+    score += 15 if volume_contraction else 0
+    score += 20 if obv_divergence else 0
+    score += 15 if ema_recovered else 0
+    score += 10 if breakout_ready else 0
+    score += 5 if volume_reentry else 0
+    if score >= 75 and breakout_ready:
+        stage = "돌파 준비"
+    elif score >= 65:
+        stage = "A 초기 후보"
+    elif score >= 50:
+        stage = "바닥 준비 관찰"
+    else:
+        stage = ""
+    reasons = []
+    if higher_low: reasons.append("저점 방어")
+    if volume_contraction: reasons.append("재시험 거래량 감소")
+    if obv_divergence: reasons.append("OBV 선행")
+    if ema_recovered: reasons.append("20EMA 회복")
+    if breakout_ready: reasons.append("직전 고점 접근")
+    if volume_reentry: reasons.append("거래량 재유입")
+    return {"score": score, "stage": stage, "reason": "·".join(reasons) or "조건 누적 중",
+            "l1_price": l1, "l2_price": l2, "atr_percent": round(atr_percent, 3),
+            "higher_low": higher_low, "volume_contraction": volume_contraction,
+            "obv_divergence": obv_divergence, "ema_recovered": ema_recovered,
+            "breakout_ready": breakout_ready, "volume_reentry": volume_reentry}
 
 
 def analyze_pine_h4_bull(candles: list[dict[str, Any]], pivot_bars: int = 12,
@@ -684,6 +786,7 @@ class Scanner:
         self.connected = False
         self.updated_at = 0
         self.performance_records = self.load_performance()
+        self.early_radar_records = self.load_early_radar()
         self.daily_counts = self.load_daily_counts()
         self.daily_history = self.load_daily_history()
         self.active_session_key = kst_session_date(int(time.time() * 1000))
@@ -700,6 +803,13 @@ class Scanner:
             return rows if isinstance(rows, dict) else {}
         except (OSError, ValueError):
             return {}
+
+    def load_early_radar(self) -> list[dict[str, Any]]:
+        try:
+            rows = json.loads(EARLY_RADAR_FILE.read_text(encoding="utf-8"))
+            return rows if isinstance(rows, list) else []
+        except (OSError, ValueError):
+            return []
 
     def load_daily_history(self) -> dict[str, dict[str, Any]]:
         try:
@@ -1020,13 +1130,41 @@ class Scanner:
                 candles = await response.json()
             current = coin.ticks[-1].price if coin.ticks else 0.0
             context = analyze_a_context(candles, current)
+            radar = analyze_early_bottom_radar(candles, current)
             pine_structure = analyze_pine_h4_bull(candles)
             coin.a_checked_at = now
+            coin.radar_checked_at = now
             coin.a_near = bool(context["near"])
             coin.a_price = context["price"]
             coin.a_distance_percent = context["distance"]
             coin.a_defended = bool(context["defended"])
             coin.a_reason = str(context["reason"])
+            previous_radar_stage = coin.radar_stage
+            coin.radar_score = int(radar.get("score", 0))
+            coin.radar_stage = str(radar.get("stage", ""))
+            coin.radar_reason = str(radar.get("reason", "조건 누적 중"))
+            coin.radar_l1_price = radar.get("l1_price")
+            coin.radar_l2_price = radar.get("l2_price")
+            coin.radar_atr_percent = radar.get("atr_percent")
+            coin.radar_obv_divergence = bool(radar.get("obv_divergence"))
+            coin.radar_volume_contraction = bool(radar.get("volume_contraction"))
+            coin.radar_ema_recovered = bool(radar.get("ema_recovered"))
+            coin.radar_breakout_ready = bool(radar.get("breakout_ready"))
+            if coin.radar_stage and not previous_radar_stage:
+                recent = next((item for item in reversed(self.early_radar_records)
+                               if item.get("market") == coin.market), None)
+                if recent is None or now - int(recent.get("first_at_ms", 0)) >= EARLY_RADAR_REDETECTION_MS:
+                    coin.radar_first_at = now
+                    coin.radar_first_price = current
+                    self.early_radar_records.append({
+                        "radar_id": f"{coin.market}-{now}", "market": coin.market,
+                        "symbol": coin.market.split("-", 1)[1], "engine_version": "V2.8-early-radar-1",
+                        "first_at_ms": now, "first_price": current, "first_stage": coin.radar_stage,
+                        "first_score": coin.radar_score, "reason": coin.radar_reason,
+                        "l1_price": coin.radar_l1_price, "l2_price": coin.radar_l2_price,
+                        "atr_percent": coin.radar_atr_percent, "peak_return": 0.0,
+                        "mae": 0.0, "current_return": 0.0, "status": "진행 중",
+                    })
             self.apply_pine_h4_structure(coin, pine_structure, now)
             signal_id = f"{coin.market}-{coin.flow_first_at}"
             record = next((item for item in reversed(self.performance_records)
@@ -1044,6 +1182,30 @@ class Scanner:
             coin.a_reason = f"4시간봉 조회 실패: {type(exc).__name__}"
         finally:
             self.a_refreshing.discard(coin.market)
+
+    def update_early_radar_performance(self, coin: Coin, price: float, now: int) -> None:
+        for record in self.early_radar_records:
+            if record.get("market") != coin.market or not record.get("first_at_ms"):
+                continue
+            age = now - int(record["first_at_ms"])
+            if age < 0 or age > 24 * 60 * 60_000 or not record.get("first_price"):
+                continue
+            ret = pct(price, float(record["first_price"]))
+            record["current_return"] = round(ret, 4)
+            record["peak_return"] = round(max(float(record.get("peak_return", 0.0)), ret), 4)
+            record["mae"] = round(min(float(record.get("mae", 0.0)), ret), 4)
+            if ret >= 10.0 and not record.get("hit_10_at_ms"):
+                record["hit_10_at_ms"] = now
+            if ret <= -5.0 and not record.get("hit_minus_5_at_ms"):
+                record["hit_minus_5_at_ms"] = now
+            hit_10 = int(record.get("hit_10_at_ms") or 0)
+            hit_minus_5 = int(record.get("hit_minus_5_at_ms") or 0)
+            if hit_10 and (not hit_minus_5 or hit_10 < hit_minus_5):
+                record["status"] = "성공"
+            elif hit_minus_5 and (not hit_10 or hit_minus_5 < hit_10):
+                record["status"] = "실패"
+            elif age >= 12 * 60 * 60_000:
+                record["status"] = "실패"
 
     def load_performance(self) -> list[dict[str, Any]]:
         try:
@@ -1174,6 +1336,10 @@ class Scanner:
             "confirm_price", "confirm_at", "confirm_a_price", "confirm_b_price", "confirm_c_price",
             "entry_cycle_state", "entry_attempt_count", "entry_attempt_price", "entry_stop_price",
             "entry_stopped_at", "entry_cycle_reason",
+            "radar_checked_at", "radar_score", "radar_stage", "radar_reason",
+            "radar_first_at", "radar_first_price", "radar_l1_price", "radar_l2_price",
+            "radar_atr_percent", "radar_obv_divergence", "radar_volume_contraction",
+            "radar_ema_recovered", "radar_breakout_ready",
         )
         for code, values in saved.items():
             coin = self.coins.get(code)
@@ -1242,6 +1408,19 @@ class Scanner:
                     "entry_stop_price": coin.entry_stop_price,
                     "entry_stopped_at": coin.entry_stopped_at,
                     "entry_cycle_reason": coin.entry_cycle_reason,
+                    "radar_checked_at": coin.radar_checked_at,
+                    "radar_score": coin.radar_score,
+                    "radar_stage": coin.radar_stage,
+                    "radar_reason": coin.radar_reason,
+                    "radar_first_at": coin.radar_first_at,
+                    "radar_first_price": coin.radar_first_price,
+                    "radar_l1_price": coin.radar_l1_price,
+                    "radar_l2_price": coin.radar_l2_price,
+                    "radar_atr_percent": coin.radar_atr_percent,
+                    "radar_obv_divergence": coin.radar_obv_divergence,
+                    "radar_volume_contraction": coin.radar_volume_contraction,
+                    "radar_ema_recovered": coin.radar_ema_recovered,
+                    "radar_breakout_ready": coin.radar_breakout_ready,
                 }
                 for code, coin in self.coins.items()
             }
@@ -1251,6 +1430,10 @@ class Scanner:
             performance_tmp = PERFORMANCE_FILE.with_suffix(".tmp")
             performance_tmp.write_text(json.dumps(self.performance_records[-2000:], ensure_ascii=False), encoding="utf-8")
             performance_tmp.replace(PERFORMANCE_FILE)
+            radar_tmp = EARLY_RADAR_FILE.with_suffix(".tmp")
+            radar_tmp.write_text(json.dumps(self.early_radar_records[-4000:], ensure_ascii=False),
+                                 encoding="utf-8")
+            radar_tmp.replace(EARLY_RADAR_FILE)
             # Keep date-based counts separately; a new KST date naturally starts at zero.
             recent_days = sorted(self.daily_counts)[-90:]
             daily_tmp = DAILY_COUNT_FILE.with_suffix(".tmp")
@@ -1315,11 +1498,18 @@ class Scanner:
                 self.update_confirm_entry(coin, self.latest[code], now)
                 abc_tracking = coin.abc_stage in {"PRE-A", "A 방어", "A 확인", "B 진행", "C 눌림 대기"}
                 confirm_tracking = coin.entry_cycle_state in {"CONFIRM 재확인 대기", "첫 시도", "단기 실패", "재진입"}
-                if (coin.flow_stage or abc_tracking or confirm_tracking) and now - coin.a_checked_at >= A_CONTEXT_REFRESH_MS:
+                row = self.latest[code]
+                early_activity = (row.get("trade_count_30s", 0.0) >= 2
+                                  and row.get("flow_3m", 0.0) >= 0.45
+                                  and row.get("buy_1m", 0.0) >= 0.47)
+                refresh_due = A_CONTEXT_REFRESH_MS if (coin.flow_stage or abc_tracking or confirm_tracking) else EARLY_RADAR_REFRESH_MS
+                if (coin.flow_stage or abc_tracking or confirm_tracking or coin.radar_stage or early_activity) \
+                        and now - coin.a_checked_at >= refresh_due:
                     asyncio.create_task(self.refresh_a_context(coin))
                 if coin.flow_stage != previous_flow_stage:
                     self.record_flow_transition(coin, previous_flow_stage, previous_first_at, self.latest[code], now)
                 self.update_flow_performance(coin, self.latest[code], now)
+                self.update_early_radar_performance(coin, float(self.latest[code].get("price", 0.0)), now)
                 self.record_decision(coin, self.latest[code], now, btc_falling)
                 if event:
                     self.events.append(event)
@@ -1366,11 +1556,15 @@ class Scanner:
         btc_falling = float(btc_row.get("change_3m", 0.0)) <= -0.35 or float(btc_row.get("change_1m", 0.0)) <= -0.20
         rows = []
         for code, coin in self.coins.items():
+            radar_visible = bool(coin.radar_stage) and (
+                not coin.radar_checked_at or now - coin.radar_checked_at <= 45 * 60_000
+            )
             abc_visible = bool(coin.abc_stage) and (
                 coin.abc_stage not in {"ABC 확인", "A 실패"} or now - coin.abc_updated_at <= 30 * 60_000
             )
             confirm_visible = coin.entry_cycle_state in {"CONFIRM 재확인 대기", "첫 시도", "단기 실패", "재진입"}
-            if code not in self.latest or (not coin.flow_stage and not abc_visible and not confirm_visible):
+            if code not in self.latest or (not coin.flow_stage and not abc_visible
+                                           and not confirm_visible and not radar_visible):
                 continue
             row = public_coin(coin, self.latest[code])
             row["first_seen_at"] = coin.flow_first_at
@@ -1409,6 +1603,15 @@ class Scanner:
                         "entry_attempt_price": coin.entry_attempt_price,
                         "entry_stop_price": coin.entry_stop_price,
                         "entry_cycle_reason": coin.entry_cycle_reason})
+            row.update({"radar_score": coin.radar_score, "radar_stage": coin.radar_stage,
+                        "radar_reason": coin.radar_reason, "radar_first_at_ms": coin.radar_first_at,
+                        "radar_first_price": coin.radar_first_price,
+                        "radar_l1_price": coin.radar_l1_price, "radar_l2_price": coin.radar_l2_price,
+                        "radar_atr_percent": coin.radar_atr_percent,
+                        "radar_obv_divergence": coin.radar_obv_divergence,
+                        "radar_volume_contraction": coin.radar_volume_contraction,
+                        "radar_ema_recovered": coin.radar_ema_recovered,
+                        "radar_breakout_ready": coin.radar_breakout_ready})
             rows.append(row)
         stage_order = {"돌파 확인": 0, "소액 시도 가능": 1, "기다림": 2, "매수 금지": 3}
         rows.sort(key=lambda row: (stage_order.get(row["action"], 9), -row["score"], -(row["first_seen_at"] or 0)))
@@ -1432,11 +1635,14 @@ class Scanner:
             {"재진입": 0, "첫 시도": 1}.get(row.get("entry_cycle_state"), 9),
             -int(row.get("score", 0))))
         a_tracking = [row for row in rows if not row.get("entry_review")
-                      and (row.get("abc_stage") in {"PRE-A", "B 진행", "C 눌림 대기"}
+                      and (row.get("radar_stage") in {"바닥 준비 관찰", "A 초기 후보", "돌파 준비"}
+                           or row.get("abc_stage") in {"PRE-A", "B 진행", "C 눌림 대기"}
                            or row.get("entry_cycle_state") in {"CONFIRM 재확인 대기", "단기 실패"})]
         a_tracking.sort(key=lambda row: (
             {"단기 실패": 0, "CONFIRM 재확인 대기": 1}.get(row.get("entry_cycle_state"),
-                {"C 눌림 대기": 2, "B 진행": 3, "PRE-A": 4}.get(row.get("abc_stage"), 9)),
+                {"돌파 준비": 2, "A 초기 후보": 3, "바닥 준비 관찰": 4}.get(
+                    row.get("radar_stage"),
+                    {"C 눌림 대기": 5, "B 진행": 6, "PRE-A": 7}.get(row.get("abc_stage"), 9))),
             -int(row.get("daily_pre_a_count", 0)),
             -int(row.get("score", 0)),
         ))
@@ -1458,6 +1664,8 @@ class Scanner:
             "top_detection_counts": self.top_daily_counts(now),
             "entry_review_results": entry_review[:3],
             "a_tracking_results": a_tracking[:5],
+            "early_radar_count": sum(bool(row.get("radar_stage")) for row in rows),
+            "early_radar_results": [row for row in a_tracking if row.get("radar_stage")][:10],
             "daily_counts": self.daily_counts.get(kst_session_date(now), {}),
         }
 
@@ -1475,6 +1683,10 @@ async def main() -> None:
         app.router.add_get("/api/daily-history", lambda _: web.json_response({
             "engine": "BES Flow CONFIRM Re-entry V2.8",
             "days": scanner.daily_history,
+        }))
+        app.router.add_get("/api/early-radar-performance", lambda _: web.json_response({
+            "engine": "BES V2.8 Early Bottom Radar 1",
+            "records": scanner.early_radar_records[-4000:],
         }))
         app.router.add_get("/health", lambda _: web.json_response({"ok": scanner.connected, "markets": len(scanner.coins)}))
         app.router.add_static("/", STATIC_DIR, show_index=True)
