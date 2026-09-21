@@ -45,6 +45,7 @@ A_CONTEXT_REFRESH_MS = 5 * 60_000
 EARLY_RADAR_REFRESH_MS = 15 * 60_000
 EARLY_RADAR_REDETECTION_MS = 12 * 60 * 60_000
 REDETECTION_GAP_MS = 30 * 60_000
+DISPLAY_SNAPSHOT_MS = 15 * 60_000
 STATE_STRENGTH = {"일반 감시": 0, "관찰 유지": 1, "수급 유입": 2, "상승 가능": 3}
 
 
@@ -796,6 +797,11 @@ class Scanner:
                 self.archive_completed_session(day_key, day_start + 33 * 60 * 60 * 1000)
         self.session: ClientSession | None = None
         self.a_refreshing: set[str] = set()
+        # The engine keeps calculating in real time, but the dashboard receives
+        # only a completed decision snapshot.  This prevents borderline coins
+        # from appearing/disappearing every 1.5 seconds while a user is reading.
+        self.published_snapshot: dict[str, Any] | None = None
+        self.published_at = 0
 
     def load_daily_counts(self) -> dict[str, dict[str, dict[str, Any]]]:
         try:
@@ -1549,7 +1555,7 @@ class Scanner:
             await asyncio.sleep(delay)
             delay = min(delay * 2, 30)
 
-    def snapshot(self) -> dict[str, Any]:
+    def _build_snapshot(self) -> dict[str, Any]:
         now = int(time.time() * 1000)
         session_start, session_end = kst_session_bounds(now)
         btc_row = self.latest.get("KRW-BTC", {})
@@ -1668,6 +1674,32 @@ class Scanner:
             "early_radar_results": [row for row in a_tracking if row.get("radar_stage")][:10],
             "daily_counts": self.daily_counts.get(kst_session_date(now), {}),
         }
+
+    def snapshot(self) -> dict[str, Any]:
+        """Publish one stable, complete dashboard decision set every 15 minutes."""
+        now = int(time.time() * 1000)
+        ready = bool(self.coins) and len(self.latest) >= max(1, int(len(self.coins) * 0.80))
+        due = self.published_snapshot is None or now - self.published_at >= DISPLAY_SNAPSHOT_MS
+
+        if ready and due:
+            self.published_snapshot = self._build_snapshot()
+            self.published_at = now
+
+        if self.published_snapshot is None:
+            result = self._build_snapshot()
+            result["snapshot_status"] = "데이터 준비 중"
+            result["snapshot_complete"] = False
+            return result
+
+        # Keep the candidate membership stable, while reporting the current
+        # connection health separately.
+        result = dict(self.published_snapshot)
+        result["connected"] = self.connected
+        result["snapshot_status"] = "15분 확정본"
+        result["snapshot_complete"] = True
+        result["snapshot_at_ms"] = self.published_at
+        result["next_snapshot_at_ms"] = self.published_at + DISPLAY_SNAPSHOT_MS
+        return result
 
 
 async def main() -> None:
