@@ -25,6 +25,7 @@ OUT = Path("data/latest.json")
 WATCH_STATE = Path("data/watch_state.json")
 STABLE_SYMBOLS = {"USDT", "USDC", "DAI", "TUSD", "FDUSD", "USDE", "PYUSD"}
 MIN_TRADE_VALUE_24H = 500_000_000
+MIN_EARLY_RESEARCH_VALUE_24H = 100_000_000
 MAX_RESULTS = 20
 TRACK_HOURS = 12
 SUCCESS_RETURN = 10.0
@@ -42,6 +43,7 @@ PAPER_HISTORY_LIMIT = 500
 PAPER_PENDING_MINUTES = 45
 MIN_ROTATION_PRICE = 0.01
 SAFETY_RESEARCH_ONLY = True
+VALIDATION_HOURS = 24
 
 PAPER_STRATEGIES = {
     "A_EARLY": "A 초입형",
@@ -468,6 +470,39 @@ def is_pump_late(row: dict[str, Any]) -> bool:
     )
 
 
+def chase_risk_reasons(row: dict[str, Any]) -> list[str]:
+    """Block the recurring late-entry shape while keeping it measurable."""
+    reasons: list[str] = []
+    if float(row["change_12h"]) >= 6.0:
+        reasons.append("12시간 상승률 +6% 이상")
+    if float(row["change_1h"]) >= 5.0:
+        reasons.append("1시간 상승률 +5% 이상")
+    if float(row["distance_from_ema20"]) >= 7.0:
+        reasons.append("20시간 EMA 대비 +7% 이상 이격")
+    if float(row["upper_wick_ratio"]) > 0.55:
+        reasons.append("긴 윗꼬리")
+    if float(row["drawdown_from_high_4h"]) <= -5.0 and float(row["change_4h"]) >= 3.0:
+        reasons.append("급등 고점 이후 되밀림")
+    return reasons
+
+
+def early_low_liquidity_research(row: dict[str, Any]) -> bool:
+    """Observe early capital flow below the old 500M floor; never recommend it directly."""
+    value = float(row["trade_value_24h"])
+    return bool(
+        MIN_EARLY_RESEARCH_VALUE_24H <= value < MIN_TRADE_VALUE_24H
+        and float(row.get("flow_percentile_15m", 0.0)) >= 90.0
+        and float(row["value_ratio_15m"]) >= 2.0
+        and float(row["value_ratio_1h"]) >= 1.35
+        and -0.5 <= float(row["change_1h"]) < 3.0
+        and float(row["change_12h"]) < 6.0
+        and float(row["close_position"]) >= 0.65
+        and float(row["upper_wick_ratio"]) <= 0.45
+        and bool(row["obv_improving_4h"])
+        and not chase_risk_reasons(row)
+    )
+
+
 def watch_stage(
     row: dict[str, Any], prep: int, ignition: int, rotation: int, rotation_streak: int
 ) -> tuple[str, str]:
@@ -526,11 +561,13 @@ def update_watch_state(
         )
         first_dt = parse_utc(prior.get("first_watch_at")) if prior else None
         age = max(0.0, (now - first_dt).total_seconds() / 3600.0) if first_dt else 0.0
-        should_start = (
+        standard_start = (
             (prep >= 55 or rotation >= 55)
             and float(row["trade_value_24h"]) >= MIN_TRADE_VALUE_24H
             and not is_pump_late(row)
         )
+        low_liquidity_research_start = early_low_liquidity_research(row)
+        should_start = standard_start or low_liquidity_research_start
         should_keep = prior is not None and age < WATCH_HOURS and (
             age < MIN_WATCH_HOURS or prep >= 35 or ignition >= 35 or rotation >= 35
         )
@@ -542,6 +579,11 @@ def update_watch_state(
         item = {
             **public_row(row),
             "engine_version": "V5",
+            "watch_lane": (
+                "저유동성 선행관찰" if low_liquidity_research_start
+                or (prior and prior.get("watch_lane") == "저유동성 선행관찰")
+                else "표준"
+            ),
             "first_watch_at": prior.get("first_watch_at", now_iso) if prior else now_iso,
             "first_watch_price": first_price,
             "first_detected_at": prior.get("first_watch_at", now_iso) if prior else now_iso,
@@ -636,6 +678,63 @@ def tracking_extremes(
         if success_at or failure_at:
             break
     return peak, mae, success_at, failure_at
+
+
+def validation_barrier(
+    row: dict[str, Any], first_dt: datetime, first_price: float
+) -> dict[str, Any]:
+    """Evaluate +5% versus -3% from recorded OHLC; ties are marked, not guessed."""
+    end_dt = first_dt + timedelta(hours=VALIDATION_HOURS)
+    for bar in row.get("_tracking_bars", []):
+        bar_dt = parse_utc(bar.get("time"))
+        if bar_dt is None or bar_dt < first_dt or bar_dt > end_dt:
+            continue
+        hit_up = pct_change(float(bar["high"]), first_price) >= 5.0
+        hit_down = pct_change(float(bar["low"]), first_price) <= -3.0
+        if hit_up and hit_down:
+            return {"result": "동일 봉 동시 도달·순서 미확정", "observed_at": bar.get("time")}
+        if hit_up:
+            return {"result": "+5% 선도달", "observed_at": bar.get("time")}
+        if hit_down:
+            return {"result": "-3% 선도달", "observed_at": bar.get("time")}
+    return {"result": "미도달", "observed_at": None}
+
+
+def update_forward_returns(
+    prior: Any, elapsed_hours: float, current_return: float
+) -> dict[str, Any]:
+    """Persist the first scan observed after each requested validation horizon."""
+    values = dict(prior) if isinstance(prior, dict) else {}
+    for hours in (3, 6, 12, 24):
+        key = f"{hours}h"
+        if elapsed_hours >= hours and key not in values:
+            values[key] = round(current_return, 4)
+    return values
+
+
+def missed_diagnostic(row: dict[str, Any], memory: dict[str, Any] | None) -> dict[str, Any]:
+    memory = memory or {}
+    had_early_memory = any(
+        memory.get(key)
+        for key in ("first_preparation_at", "first_ignition_at", "first_rotation_at")
+    )
+    if had_early_memory and float(row["trade_value_24h"]) < MIN_TRADE_VALUE_24H:
+        category = "사전 흔적 있었으나 거래대금 문턱에서 차단"
+        countermeasure = "V5.2 저유동성 선행관찰로 병행 검증"
+    elif had_early_memory:
+        category = "사전 흔적 있었으나 후보 승격 실패"
+        countermeasure = "준비→점화→자금유입 전환 이력과 탈락 조건을 연속 기록"
+    elif float(row["change_12h"]) >= SUCCESS_RETURN:
+        category = "급등 후 최초 확인"
+        countermeasure = "추천하지 않고 추격금지 유지; 상승 전 데이터 부족으로 분리"
+    else:
+        category = "필터 탈락"
+        countermeasure = "탈락 당시 원인과 이후 최고수익을 V5.2 대조군에 저장"
+    return {
+        "category": category,
+        "countermeasure": countermeasure,
+        "had_early_memory": had_early_memory,
+    }
 
 
 def update_signal_memory(
@@ -1156,6 +1255,10 @@ def main() -> None:
             "action": current_action,
             "detection_route": prior.get("detection_route", qualified_routes.get(market, "V3 이관")),
             "engine_version": prior.get("engine_version", "LEGACY"),
+            "forward_returns": update_forward_returns(
+                prior.get("forward_returns"), elapsed_hours, current_return
+            ),
+            "barrier_5_or_3": validation_barrier(row, first_dt, first_price),
         }
 
         if failure_at and (not success_at or failure_at == success_at):
@@ -1193,6 +1296,14 @@ def main() -> None:
             pct_change(float(row["current_price"]), first_price), 4
         )
         item["action"] = "성과 완료"
+        first_dt = parse_utc(prior.get("first_detected_at"))
+        if first_dt is not None:
+            elapsed_hours = max(0.0, (now - first_dt).total_seconds() / 3600.0)
+            current_return = pct_change(float(row["current_price"]), first_price)
+            item["forward_returns"] = update_forward_returns(
+                prior.get("forward_returns"), elapsed_hours, current_return
+            )
+            item["barrier_5_or_3"] = validation_barrier(row, first_dt, first_price)
         refreshed_completed.append(item)
     completed = refreshed_completed
 
@@ -1219,6 +1330,7 @@ def main() -> None:
         row = scored_rows[market]
         first_price = float(row["current_price"])
         chase_risk = float(row["change_12h"])
+        chase_reasons = chase_risk_reasons(row)
         episode = {
             **public_row(row),
             "first_detected_at": now_iso,
@@ -1229,13 +1341,16 @@ def main() -> None:
             "mae_since_detection": 0.0,
             "elapsed_hours": 0.0,
             "status": "진행 중",
-            "entry_quality": "정상 후보" if chase_risk < 6.0 else ("추격주의" if chase_risk < 10.0 else "추천 제외"),
-            "action": str(watch_by_market[market]["action"]),
+            "entry_quality": "정상 후보" if not chase_reasons else "추격 차단",
+            "action": "추격 차단" if chase_reasons else str(watch_by_market[market]["action"]),
             "detection_route": qualified_routes[market],
-            "engine_version": "V5.1",
+            "engine_version": "V5.2",
             "first_watch_at": watch_by_market[market]["first_watch_at"],
             "first_watch_price": watch_by_market[market]["first_watch_price"],
             "initial_research_snapshot": initial_research_snapshot(row, btc_context),
+            "chase_risk_reasons": chase_reasons,
+            "forward_returns": {},
+            "barrier_5_or_3": {"result": "미도달", "observed_at": None},
         }
         tracking.append(episode)
         new_signals.append(episode)
@@ -1244,6 +1359,7 @@ def main() -> None:
     candidates = [
         row for row in watchlist
         if row["action"] in {"초입 검토", "강한 관찰"}
+        and not chase_risk_reasons(row)
     ]
 
     candidates.sort(
@@ -1258,6 +1374,28 @@ def main() -> None:
     )
     candidates = candidates[:MAX_RESULTS]
     actionable_count = sum(row["action"] == "초입 검토" for row in candidates)
+    # V5.2 stays research-only until it beats the legacy lane on completed samples.
+    research_candidates_v52 = []
+    for row in watchlist:
+        chase_reasons = chase_risk_reasons(row)
+        if chase_reasons:
+            continue
+        legacy_eligible = row["action"] in {"초입 검토", "강한 관찰"}
+        low_liquidity_early = early_low_liquidity_research(row)
+        if not legacy_eligible and not low_liquidity_early:
+            continue
+        research_candidates_v52.append({
+            **row,
+            "research_lane": "기존 희소후보" if legacy_eligible else "저유동성 선행관찰",
+            "adoption_status": "병행 검증 중·실제 신호 미반영",
+        })
+    research_candidates_v52.sort(
+        key=lambda row: (
+            row["research_lane"] != "기존 희소후보",
+            -int(row.get("rotation_score", 0)),
+            -int(row.get("ignition_score", 0)),
+        )
+    )
     leaders = sorted(
         (public_row(row) for row in scored_rows.values()),
         key=lambda row: float(row["change_12h"]),
@@ -1273,6 +1411,7 @@ def main() -> None:
             "score": row["score"],
             "reason": "; ".join(exclusion_reasons(row, int(row["score"]))),
             "pre_signal_memory": signal_memory.get(row["market"]),
+            "diagnostic": missed_diagnostic(row, signal_memory.get(row["market"])),
         }
         for row in leaders
         if row["market"] not in detected_markets
@@ -1287,6 +1426,16 @@ def main() -> None:
         if int(row["score"]) >= 70 and float(row["change_12h"]) >= SUCCESS_RETURN
     ]
     late_surges.sort(key=lambda row: (-float(row["change_12h"]), -int(row["score"])))
+    chase_blocked = [
+        {
+            **public_row(row),
+            "action": "추격 차단",
+            "chase_risk_reasons": chase_risk_reasons(row),
+        }
+        for row in scored_rows.values()
+        if chase_risk_reasons(row)
+    ]
+    chase_blocked.sort(key=lambda row: (-float(row["change_12h"]), -int(row["score"])))
     high_score_blocked = [
         {
             **public_row(row),
@@ -1309,8 +1458,8 @@ def main() -> None:
     v5_ongoing = sum(str(row.get("engine_version", "")).startswith("V5") for row in tracking)
     v5_win_rate = round(v5_success / (v5_success + v5_failure) * 100.0, 2) if v5_success + v5_failure else None
     result = {
-        "engine": "BES BTC-Gated Early V0.2",
-        "mode": "BTC 시장 우선·희소 초입 후보",
+        "engine": "BES BTC-Gated Early V0.3",
+        "mode": "추격 차단·V5.2 병행검증",
         "btc_market": btc_context,
         "scan_interval_minutes": 15,
         "updated_at": now_iso,
@@ -1340,6 +1489,7 @@ def main() -> None:
         "monitor_count": len(market_monitor),
         "rotation_watch_count": len(rotation_watch),
         "candidates": candidates,
+        "research_candidates_v52": research_candidates_v52[:50],
         "watchlist": watchlist,
         "rotation_watch": rotation_watch,
         "market_monitor": market_monitor,
@@ -1351,6 +1501,7 @@ def main() -> None:
         "bithumb_12h_leaders": leaders,
         "missed_leaders": missed_leaders,
         "late_surges": late_surges[:20],
+        "chase_blocked": chase_blocked[:50],
         "high_score_blocked": high_score_blocked[:20],
         "risk_exclusions": risk_exclusions,
         "exclusions": exclusions,
