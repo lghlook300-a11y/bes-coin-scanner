@@ -46,6 +46,7 @@ EARLY_RADAR_REFRESH_MS = 15 * 60_000
 EARLY_RADAR_REDETECTION_MS = 12 * 60 * 60_000
 REDETECTION_GAP_MS = 30 * 60_000
 DISPLAY_SNAPSHOT_MS = 15 * 60_000
+BTC_REGIME_REFRESH_MS = 15 * 60_000
 STATE_STRENGTH = {"일반 감시": 0, "관찰 유지": 1, "수급 유입": 2, "상승 가능": 3}
 
 
@@ -178,6 +179,56 @@ def ema(values: list[float], length: int) -> float:
     for value in values[1:]:
         result = value * alpha + result * (1.0 - alpha)
     return result
+
+
+def analyze_btc_swing_regime(daily_candles: list[dict[str, Any]], h4_candles: list[dict[str, Any]]) -> dict[str, Any]:
+    """Describe the BTC swing backdrop using confirmed daily and 4H candles only."""
+    daily = sorted(daily_candles, key=lambda item: str(item.get("candle_date_time_utc", "")))[:-1]
+    h4 = sorted(h4_candles, key=lambda item: str(item.get("candle_date_time_utc", "")))[:-1]
+    if len(daily) < 22 or len(h4) < 24:
+        return {"state": "일봉·4시간봉 자료 준비 중", "daily": "확인 중", "four_hour": "확인 중",
+                "buy_zone": False, "reason": "확정봉 자료 부족"}
+
+    daily_closes = [float(item["trade_price"]) for item in daily]
+    daily_lows = [float(item["low_price"]) for item in daily]
+    h4_closes = [float(item["trade_price"]) for item in h4]
+    daily_ma20 = sum(daily_closes[-20:]) / 20
+    daily_ma20_prev = sum(daily_closes[-21:-1]) / 20
+    daily_close = daily_closes[-1]
+    daily_bottom = min(daily_lows[-20:])
+    near_daily_bottom = pct(daily_close, daily_bottom) <= 8.0
+
+    if near_daily_bottom and daily_close > daily_closes[-2]:
+        daily_state = "바닥권 반등 시도"
+    elif daily_close > daily_ma20 and daily_ma20 > daily_ma20_prev:
+        daily_state = "상승"
+    elif daily_close < daily_ma20 and daily_ma20 < daily_ma20_prev:
+        daily_state = "하락"
+    else:
+        daily_state = "횡보·전환 구간"
+
+    h4_ema20 = ema(h4_closes[-40:], 20)
+    h4_ema20_prev = ema(h4_closes[-41:-1], 20)
+    h4_close = h4_closes[-1]
+    h4_up = h4_close > h4_ema20 and h4_ema20 > h4_ema20_prev
+    h4_down = h4_close < h4_ema20 and h4_ema20 < h4_ema20_prev
+    h4_state = "상승 전환·유지" if h4_up else "하락" if h4_down else "횡보·전환 확인 중"
+
+    buy_zone = near_daily_bottom and h4_up
+    if buy_zone:
+        state = "바닥 확인 후 상승 전환 · 매수 검토"
+        reason = "일봉이 20일 저점권이고 4시간봉이 20EMA 위에서 상승"
+    elif daily_state == "상승" and h4_up:
+        state = "상승 진행 · 신규 추격 주의"
+        reason = "방향은 상승이지만 바닥권 진입 구간은 아님"
+    elif h4_down:
+        state = "하락 중 · 바닥과 상승 전환 대기"
+        reason = "4시간봉 20EMA 아래 하락"
+    else:
+        state = "바닥·상승 전환 확인 대기"
+        reason = "일봉 바닥과 4시간봉 상승이 동시에 확인되지 않음"
+    return {"state": state, "daily": daily_state, "four_hour": h4_state,
+            "buy_zone": buy_zone, "reason": reason}
 
 
 def analyze_a_context(candles: list[dict[str, Any]], current_price: float) -> dict[str, Any]:
@@ -802,6 +853,33 @@ class Scanner:
         # from appearing/disappearing every 1.5 seconds while a user is reading.
         self.published_snapshot: dict[str, Any] | None = None
         self.published_at = 0
+        self.btc_swing_regime: dict[str, Any] = {
+            "state": "일봉·4시간봉 자료 준비 중", "daily": "확인 중", "four_hour": "확인 중",
+            "buy_zone": False, "reason": "확정봉 자료 수집 전", "checked_at_ms": 0,
+        }
+
+    async def refresh_btc_swing_regime(self) -> None:
+        """Refresh the display-only swing regime every 15 minutes."""
+        while True:
+            try:
+                if self.session is not None:
+                    async with self.session.get(f"{REST_API}/candles/days",
+                                                params={"market": "KRW-BTC", "count": 40}) as response:
+                        response.raise_for_status()
+                        daily = await response.json()
+                    async with self.session.get(f"{REST_API}/candles/minutes/240",
+                                                params={"market": "KRW-BTC", "count": 60}) as response:
+                        response.raise_for_status()
+                        h4 = await response.json()
+                    regime = analyze_btc_swing_regime(daily, h4)
+                    regime["checked_at_ms"] = int(time.time() * 1000)
+                    self.btc_swing_regime = regime
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.events.append({"timestamp_ms": int(time.time() * 1000),
+                                    "state": "BTC 일봉·4시간봉 확인 오류", "error": str(exc)})
+            await asyncio.sleep(BTC_REGIME_REFRESH_MS / 1000)
 
     def load_daily_counts(self) -> dict[str, dict[str, dict[str, Any]]]:
         try:
@@ -1661,7 +1739,9 @@ class Scanner:
             "buy_review_count": sum(row["action"] in {"소액 시도 가능", "돌파 확인"} for row in rows),
             "champion_count": sum(row.get("detection_route") == "기존 수급" for row in rows),
             "challenger_count": sum(row.get("detection_route") == "A+수급" for row in rows),
-            "btc_market": {"state": "단기 하락·고위험" if btc_falling else "보통", "blocking": False},
+            "btc_market": {**self.btc_swing_regime,
+                           "short_warning": "단기 급락 주의" if btc_falling else "없음",
+                           "blocking": False},
             "results": rows,
             "events": self.events[-100:],
             "performance_records": self.performance_records[-200:],
@@ -1725,7 +1805,8 @@ async def main() -> None:
         runner = web.AppRunner(app)
         await runner.setup()
         await web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", "8080"))).start()
-        await asyncio.gather(scanner.stream(session), scanner.evaluate(), scanner.save_loop())
+        await asyncio.gather(scanner.stream(session), scanner.evaluate(), scanner.save_loop(),
+                             scanner.refresh_btc_swing_regime())
 
 
 if __name__ == "__main__":
