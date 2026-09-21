@@ -142,6 +142,11 @@ class Coin:
     radar_volume_contraction: bool = False
     radar_ema_recovered: bool = False
     radar_breakout_ready: bool = False
+    swing_checked_at: int = 0
+    daily_state: str = "확인 중"
+    h4_state: str = "확인 중"
+    swing_state: str = "일봉·4시간봉 확인 중"
+    swing_buy_zone: bool = False
 
 
 def pct(new: float, old: float) -> float:
@@ -1216,6 +1221,20 @@ class Scanner:
             context = analyze_a_context(candles, current)
             radar = analyze_early_bottom_radar(candles, current)
             pine_structure = analyze_pine_h4_bull(candles)
+            # Daily candles are requested only for active candidates and no more
+            # than once per 15 minutes, keeping API traffic and Railway cost low.
+            active_candidate = bool(coin.flow_stage or coin.abc_stage or coin.entry_cycle_state or coin.radar_stage)
+            if active_candidate and now - coin.swing_checked_at >= BTC_REGIME_REFRESH_MS:
+                async with self.session.get(f"{REST_API}/candles/days",
+                                            params={"market": coin.market, "count": 40}) as response:
+                    response.raise_for_status()
+                    daily_candles = await response.json()
+                swing = analyze_btc_swing_regime(daily_candles, candles)
+                coin.swing_checked_at = now
+                coin.daily_state = str(swing["daily"])
+                coin.h4_state = str(swing["four_hour"])
+                coin.swing_state = str(swing["state"])
+                coin.swing_buy_zone = bool(swing["buy_zone"])
             coin.a_checked_at = now
             coin.radar_checked_at = now
             coin.a_near = bool(context["near"])
@@ -1348,6 +1367,20 @@ class Scanner:
                     record[key] = now
             if ret <= -5.0 and not record.get("hit_minus_5_at_ms"):
                 record["hit_minus_5_at_ms"] = now
+            # Validate from the price where the scanner first said the coin was
+            # actionable, not from the earlier flow-detection price.
+            actionable_price = float(record.get("first_actionable_price") or 0.0)
+            if actionable_price > 0:
+                actionable_ret = pct(float(row["price"]), actionable_price)
+                record["actionable_current_return"] = round(actionable_ret, 4)
+                record["actionable_peak_return"] = round(
+                    max(float(record.get("actionable_peak_return", 0.0)), actionable_ret), 4)
+                record["actionable_mae"] = round(
+                    min(float(record.get("actionable_mae", 0.0)), actionable_ret), 4)
+                if actionable_ret >= 5.0 and not record.get("actionable_hit_5_at_ms"):
+                    record["actionable_hit_5_at_ms"] = now
+                if actionable_ret <= -3.0 and not record.get("actionable_hit_minus_3_at_ms"):
+                    record["actionable_hit_minus_3_at_ms"] = now
             age = now - int(record["first_at_ms"])
             snapshots = record.setdefault("snapshots", {})
             for limit, key in ((30 * 60_000, "30m"), (60 * 60_000, "1h"), (180 * 60_000, "3h")):
@@ -1424,6 +1457,7 @@ class Scanner:
             "radar_first_at", "radar_first_price", "radar_l1_price", "radar_l2_price",
             "radar_atr_percent", "radar_obv_divergence", "radar_volume_contraction",
             "radar_ema_recovered", "radar_breakout_ready",
+            "swing_checked_at", "daily_state", "h4_state", "swing_state", "swing_buy_zone",
         )
         for code, values in saved.items():
             coin = self.coins.get(code)
@@ -1505,6 +1539,11 @@ class Scanner:
                     "radar_volume_contraction": coin.radar_volume_contraction,
                     "radar_ema_recovered": coin.radar_ema_recovered,
                     "radar_breakout_ready": coin.radar_breakout_ready,
+                    "swing_checked_at": coin.swing_checked_at,
+                    "daily_state": coin.daily_state,
+                    "h4_state": coin.h4_state,
+                    "swing_state": coin.swing_state,
+                    "swing_buy_zone": coin.swing_buy_zone,
                 }
                 for code, coin in self.coins.items()
             }
@@ -1696,6 +1735,22 @@ class Scanner:
                         "radar_volume_contraction": coin.radar_volume_contraction,
                         "radar_ema_recovered": coin.radar_ema_recovered,
                         "radar_breakout_ready": coin.radar_breakout_ready})
+            entry_price = float(coin.entry_attempt_price or row.get("current_price") or 0.0)
+            stop_price = float(coin.entry_stop_price or row.get("decision_stop_price") or 0.0)
+            target_price = entry_price * 1.05 if entry_price else 0.0
+            risk = entry_price - stop_price if entry_price and 0 < stop_price < entry_price else 0.0
+            reward = target_price - entry_price if entry_price else 0.0
+            row.update({
+                "daily_state": coin.daily_state,
+                "h4_state": coin.h4_state,
+                "swing_state": coin.swing_state,
+                "swing_buy_zone": coin.swing_buy_zone,
+                "review_price": round(entry_price, 8) if entry_price else None,
+                "review_stop_price": round(stop_price, 8) if stop_price else None,
+                "review_stop_percent": round(pct(stop_price, entry_price), 2) if risk else None,
+                "review_target_price": round(target_price, 8) if target_price else None,
+                "review_rr": round(reward / risk, 2) if risk else None,
+            })
             rows.append(row)
         stage_order = {"돌파 확인": 0, "소액 시도 가능": 1, "기다림": 2, "매수 금지": 3}
         rows.sort(key=lambda row: (stage_order.get(row["action"], 9), -row["score"], -(row["first_seen_at"] or 0)))
@@ -1730,6 +1785,22 @@ class Scanner:
             -int(row.get("daily_pre_a_count", 0)),
             -int(row.get("score", 0)),
         ))
+        actionable_records = [record for record in self.performance_records
+                              if record.get("first_actionable_at_ms")]
+        actionable_records.sort(key=lambda record: int(record.get("first_actionable_at_ms") or 0), reverse=True)
+        recent_actionable = actionable_records[:20]
+        hit_5_first = 0
+        hit_minus_3_first = 0
+        pending = 0
+        for record in recent_actionable:
+            hit_5 = int(record.get("actionable_hit_5_at_ms") or 0)
+            hit_minus_3 = int(record.get("actionable_hit_minus_3_at_ms") or 0)
+            if hit_5 and (not hit_minus_3 or hit_5 < hit_minus_3):
+                hit_5_first += 1
+            elif hit_minus_3 and (not hit_5 or hit_minus_3 < hit_5):
+                hit_minus_3_first += 1
+            else:
+                pending += 1
         return {
             "engine": "BES Flow CONFIRM Re-entry V2.8",
             "connected": self.connected,
@@ -1753,6 +1824,13 @@ class Scanner:
             "early_radar_count": sum(bool(row.get("radar_stage")) for row in rows),
             "early_radar_results": [row for row in a_tracking if row.get("radar_stage")][:10],
             "daily_counts": self.daily_counts.get(kst_session_date(now), {}),
+            "actionable_validation": {
+                "sample_count": len(recent_actionable),
+                "hit_5_first": hit_5_first,
+                "hit_minus_3_first": hit_minus_3_first,
+                "pending": pending,
+                "win_rate": round(hit_5_first / max(1, hit_5_first + hit_minus_3_first) * 100.0, 1),
+            },
         }
 
     def snapshot(self) -> dict[str, Any]:
