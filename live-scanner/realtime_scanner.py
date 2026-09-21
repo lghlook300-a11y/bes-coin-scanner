@@ -47,6 +47,8 @@ EARLY_RADAR_REDETECTION_MS = 12 * 60 * 60_000
 REDETECTION_GAP_MS = 30 * 60_000
 DISPLAY_SNAPSHOT_MS = 15 * 60_000
 BTC_REGIME_REFRESH_MS = 15 * 60_000
+MAX_DETAIL_MARKETS = 60
+DETAIL_ROTATION_MS = 15 * 60_000
 STATE_STRENGTH = {"일반 감시": 0, "관찰 유지": 1, "수급 유입": 2, "상승 가능": 3}
 
 
@@ -862,6 +864,52 @@ class Scanner:
             "state": "일봉·4시간봉 자료 준비 중", "daily": "확인 중", "four_hour": "확인 중",
             "buy_zone": False, "reason": "확정봉 자료 수집 전", "checked_at_ms": 0,
         }
+        # Low-cost swing mode: all markets receive lightweight ticker updates,
+        # while only a rotating shortlist receives trade/orderbook depth.
+        self.light_tickers: dict[str, dict[str, float]] = {}
+        self.previous_trade_values: dict[str, float] = {}
+        self.detail_codes: set[str] = set()
+
+    def select_detail_codes(self) -> set[str]:
+        """Choose at most 60 markets for expensive trade/orderbook processing."""
+        active = [code for code, coin in self.coins.items()
+                  if coin.flow_stage or coin.abc_stage or coin.entry_cycle_state or coin.radar_stage]
+        # Keep actionable/recheck candidates ahead of passive radar entries.
+        active.sort(key=lambda code: (
+            0 if self.coins[code].entry_cycle_state in {
+                "첫 시도", "재진입", "CONFIRM 재확인 대기", "단기 실패"
+            } else (1 if self.coins[code].flow_stage else 2),
+            -int(self.coins[code].radar_score),
+        ))
+
+        liquid = sorted(
+            self.light_tickers,
+            key=lambda code: float(self.light_tickers[code].get("trade_value_24h", 0.0)),
+            reverse=True,
+        )
+        momentum = sorted(
+            self.light_tickers,
+            key=lambda code: (
+                float(self.light_tickers[code].get("trade_value_delta", 0.0)),
+                float(self.light_tickers[code].get("signed_change_rate", 0.0)),
+            ),
+            reverse=True,
+        )
+        chosen: list[str] = []
+        # Preserve the most relevant existing candidates first. The rest
+        # combines liquid markets and newly accelerating markets.
+        for group in (active[:20], liquid[:30], momentum[:30], ["KRW-BTC"]):
+            for code in group:
+                if code in self.coins and code not in chosen:
+                    chosen.append(code)
+                if len(chosen) >= MAX_DETAIL_MARKETS:
+                    break
+            if len(chosen) >= MAX_DETAIL_MARKETS:
+                break
+        self.detail_codes = set(chosen)
+        for code, row in self.light_tickers.items():
+            self.previous_trade_values[code] = float(row.get("trade_value_24h", 0.0))
+        return self.detail_codes
 
     async def refresh_btc_swing_regime(self) -> None:
         """Refresh the display-only swing regime every 15 minutes."""
@@ -1430,7 +1478,15 @@ class Scanner:
         for code in codes:
             average = float(ticker_map.get(code, {}).get("acc_trade_price_24h", 0.0)) / 86_400.0
             self.coins[code] = Coin(code, max(average, 1.0))
+            ticker = ticker_map.get(code, {})
+            self.light_tickers[code] = {
+                "price": float(ticker.get("trade_price", 0.0)),
+                "trade_value_24h": float(ticker.get("acc_trade_price_24h", 0.0)),
+                "trade_value_delta": 0.0,
+                "signed_change_rate": float(ticker.get("signed_change_rate", 0.0)),
+            }
         self.restore()
+        self.select_detail_codes()
 
     def restore(self) -> None:
         try:
@@ -1596,6 +1652,13 @@ class Scanner:
             if value24 > 0:
                 observed = value24 / 86_400.0
                 coin.baseline_per_second = coin.baseline_per_second * 0.995 + observed * 0.005
+                previous = float(self.previous_trade_values.get(code, value24))
+                self.light_tickers[code] = {
+                    "price": float(payload.get("trade_price", 0.0)),
+                    "trade_value_24h": value24,
+                    "trade_value_delta": max(0.0, value24 - previous),
+                    "signed_change_rate": float(payload.get("signed_change_rate", 0.0)),
+                }
 
     async def evaluate(self) -> None:
         while True:
@@ -1648,15 +1711,21 @@ class Scanner:
             try:
                 async with session.ws_connect(WS_API, heartbeat=30) as socket:
                     codes = list(self.coins)
+                    detail_codes = sorted(self.select_detail_codes())
                     await socket.send_json([
                         {"ticket": f"bes-{uuid.uuid4()}"},
                         {"type": "ticker", "codes": codes, "isOnlyRealtime": True},
-                        {"type": "trade", "codes": codes, "isOnlyRealtime": True},
-                        {"type": "orderbook", "codes": codes, "isOnlyRealtime": True},
+                        {"type": "trade", "codes": detail_codes, "isOnlyRealtime": True},
+                        {"type": "orderbook", "codes": detail_codes, "isOnlyRealtime": True},
                     ])
                     self.connected = True
                     delay = 1
-                    async for message in socket:
+                    rotate_at = time.monotonic() + DETAIL_ROTATION_MS / 1000
+                    while time.monotonic() < rotate_at:
+                        try:
+                            message = await socket.receive(timeout=30)
+                        except asyncio.TimeoutError:
+                            continue
                         if message.type == WSMsgType.TEXT:
                             self.receive(json.loads(message.data))
                         elif message.type == WSMsgType.BINARY:
@@ -1806,6 +1875,8 @@ class Scanner:
             "connected": self.connected,
             "updated_at_ms": self.updated_at,
             "market_count": len(self.coins),
+            "detail_market_count": len(self.detail_codes),
+            "scan_mode": "저비용 스윙 모드",
             "candidate_count": len(rows),
             "buy_review_count": sum(row["action"] in {"소액 시도 가능", "돌파 확인"} for row in rows),
             "champion_count": sum(row.get("detection_route") == "기존 수급" for row in rows),
@@ -1836,7 +1907,13 @@ class Scanner:
     def snapshot(self) -> dict[str, Any]:
         """Publish one stable, complete dashboard decision set every 15 minutes."""
         now = int(time.time() * 1000)
-        ready = bool(self.coins) and len(self.latest) >= max(1, int(len(self.coins) * 0.80))
+        # In low-cost mode only the rotating detail set builds trade/orderbook
+        # rows. Readiness must therefore follow that set, not all ticker-only
+        # markets, or a fresh deployment could never publish a stable snapshot.
+        detailed_rows = set(self.latest).intersection(self.detail_codes)
+        ready = bool(self.detail_codes) and len(detailed_rows) >= max(
+            1, int(len(self.detail_codes) * 0.80)
+        )
         due = self.published_snapshot is None or now - self.published_at >= DISPLAY_SNAPSHOT_MS
 
         if ready and due:
