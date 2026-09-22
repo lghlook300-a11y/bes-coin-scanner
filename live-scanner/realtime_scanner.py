@@ -45,10 +45,10 @@ A_CONTEXT_REFRESH_MS = 5 * 60_000
 EARLY_RADAR_REFRESH_MS = 15 * 60_000
 EARLY_RADAR_REDETECTION_MS = 12 * 60 * 60_000
 REDETECTION_GAP_MS = 30 * 60_000
-DISPLAY_SNAPSHOT_MS = 15 * 60_000
+DISPLAY_SNAPSHOT_MS = 3 * 60_000
 BTC_REGIME_REFRESH_MS = 15 * 60_000
 MAX_DETAIL_MARKETS = 60
-DETAIL_ROTATION_MS = 15 * 60_000
+DETAIL_ROTATION_MS = 5 * 60_000
 STATE_STRENGTH = {"일반 감시": 0, "관찰 유지": 1, "수급 유입": 2, "상승 가능": 3}
 
 
@@ -1769,15 +1769,21 @@ class Scanner:
             row["invalidation_price"] = round(coin.flow_invalidation_price, 8) if coin.flow_invalidation_price else round(coin.flow_first_price * 0.97, 8) if coin.flow_first_price else None
             row["exit_reason"] = coin.flow_exit_reason
             row.update(trade_decision(coin, self.latest[code], btc_falling))
+            early_structure_ok = bool(
+                coin.a_near
+                or coin.a_defended
+                or coin.radar_stage in {"바닥 준비 관찰", "A 초기 후보", "돌파 준비"}
+                or coin.abc_stage in {"PRE-A", "B 진행", "C 눌림 대기", "ABC 확인"}
+            )
             if coin.entry_cycle_state in {"첫 시도", "재진입"}:
                 row["action"] = "소액 시도 가능"
                 row["decision_reason"] = coin.entry_cycle_reason
             elif coin.entry_cycle_state in {"추격 금지", "구조 종료"}:
                 row["action"] = "매수 금지"
                 row["decision_reason"] = coin.entry_cycle_reason
-            elif row["action"] in {"소액 시도 가능", "돌파 확인"}:
+            elif row["action"] in {"소액 시도 가능", "돌파 확인"} and not early_structure_ok:
                 row["action"] = "기다림"
-                row["decision_reason"] = "4H 파란 CONFIRM 재확인 전"
+                row["decision_reason"] = "바닥/A 구조 또는 4H CONFIRM 재확인 전"
             row["risk"] = "BTC 단기 하락" if btc_falling else "일반"
             row["stop_price_3pct"] = round(float(row["first_seen_price"]) * 0.97, 8) if row.get("first_seen_price") else None
             prices = [float(point[1]) for point in row.get("chart_prices", [])]
@@ -1829,9 +1835,14 @@ class Scanner:
             a_distance = pct(current, a_price) if a_price and current else None
             row["abc_current_distance"] = round(a_distance, 3) if a_distance is not None else None
             stage = str(row.get("abc_stage", ""))
-            row["entry_review"] = row.get("entry_cycle_state") in {"첫 시도", "재진입"}
-            if row["entry_review"]:
+            row["entry_review"] = (
+                row.get("entry_cycle_state") in {"첫 시도", "재진입"}
+                or row.get("action") in {"소액 시도 가능", "돌파 확인"}
+            )
+            if row.get("entry_cycle_state") in {"첫 시도", "재진입"}:
                 row["entry_review_reason"] = row.get("entry_cycle_reason")
+            elif row["entry_review"]:
+                row["entry_review_reason"] = row.get("decision_reason")
             elif row.get("entry_cycle_state") == "CONFIRM 재확인 대기":
                 row["entry_review_reason"] = "파란 CONFIRM 가격 눌림·재수급 대기"
             elif row.get("entry_cycle_state") == "단기 실패":
@@ -1930,7 +1941,7 @@ class Scanner:
         # connection health separately.
         result = dict(self.published_snapshot)
         result["connected"] = self.connected
-        result["snapshot_status"] = "15분 확정본"
+        result["snapshot_status"] = "3분 확정본"
         result["snapshot_complete"] = True
         result["snapshot_at_ms"] = self.published_at
         result["next_snapshot_at_ms"] = self.published_at + DISPLAY_SNAPSHOT_MS
