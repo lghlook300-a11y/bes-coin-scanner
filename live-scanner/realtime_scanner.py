@@ -41,6 +41,7 @@ OTHER_STATE_LOCK_MS = 10_000
 CHART_WINDOW_MS = 3 * 60_000
 CHART_BUCKET_MS = 5_000
 CANDIDATE_HOLD_MS = 3 * 60_000
+ENTRY_REVIEW_HOLD_MS = 60 * 60_000
 A_CONTEXT_REFRESH_MS = 5 * 60_000
 EARLY_RADAR_REFRESH_MS = 15 * 60_000
 EARLY_RADAR_REDETECTION_MS = 12 * 60 * 60_000
@@ -107,6 +108,9 @@ class Coin:
     last_sequence_ended_at: int = 0
     decision_action: str = ""
     decision_changed_at: int = 0
+    entry_review_first_at: int | None = None
+    entry_review_first_price: float | None = None
+    entry_review_hold_until: int = 0
     a_checked_at: int = 0
     a_near: bool = False
     a_price: float | None = None
@@ -1502,7 +1506,8 @@ class Scanner:
             "flow_invalidation_price", "flow_hold_until", "flow_exit_reason",
             "flow_cooldown_until",
             "last_sequence_ended_at",
-            "decision_action", "decision_changed_at",
+            "decision_action", "decision_changed_at", "entry_review_first_at",
+            "entry_review_first_price", "entry_review_hold_until",
             "a_checked_at", "a_near", "a_price", "a_distance_percent", "a_defended", "a_reason",
             "abc_stage", "abc_cycle_id", "abc_a_price", "abc_b_price", "abc_c_price",
             "abc_updated_at", "abc_reason",
@@ -1558,6 +1563,9 @@ class Scanner:
                     "last_sequence_ended_at": coin.last_sequence_ended_at,
                     "decision_action": coin.decision_action,
                     "decision_changed_at": coin.decision_changed_at,
+                    "entry_review_first_at": coin.entry_review_first_at,
+                    "entry_review_first_price": coin.entry_review_first_price,
+                    "entry_review_hold_until": coin.entry_review_hold_until,
                     "a_checked_at": coin.a_checked_at,
                     "a_near": coin.a_near,
                     "a_price": coin.a_price,
@@ -1755,9 +1763,11 @@ class Scanner:
                 coin.abc_stage not in {"ABC 확인", "A 실패"} or now - coin.abc_updated_at <= 30 * 60_000
             )
             confirm_visible = coin.entry_cycle_state in {"CONFIRM 재확인 대기", "첫 시도", "단기 실패", "재진입"}
+            review_hold_visible = coin.entry_review_hold_until > now
             if code not in self.latest or (not coin.flow_stage and not abc_visible
                                            and not confirm_visible and not radar_visible):
-                continue
+                if not review_hold_visible:
+                    continue
             row = public_coin(coin, self.latest[code])
             row["first_seen_at"] = coin.flow_first_at
             row["first_seen_price"] = coin.flow_first_price
@@ -1769,6 +1779,16 @@ class Scanner:
             row["invalidation_price"] = round(coin.flow_invalidation_price, 8) if coin.flow_invalidation_price else round(coin.flow_first_price * 0.97, 8) if coin.flow_first_price else None
             row["exit_reason"] = coin.flow_exit_reason
             row.update(trade_decision(coin, self.latest[code], btc_falling))
+            # The former champion is the flow decision itself.  Keep that
+            # verdict before the newer 4H/CONFIRM context can downgrade the
+            # display action; the latter remains useful context, not a gate.
+            champion_action = row["action"]
+            champion_reason = row["decision_reason"]
+            champion_qualified = champion_action in {"소액 시도 가능", "돌파 확인"} and not row.get("chase")
+            if champion_qualified and coin.entry_review_hold_until <= now:
+                coin.entry_review_first_at = now
+                coin.entry_review_first_price = float(row["current_price"])
+                coin.entry_review_hold_until = now + ENTRY_REVIEW_HOLD_MS
             early_structure_ok = bool(
                 coin.a_near
                 or coin.a_defended
@@ -1810,7 +1830,7 @@ class Scanner:
                         "radar_volume_contraction": coin.radar_volume_contraction,
                         "radar_ema_recovered": coin.radar_ema_recovered,
                         "radar_breakout_ready": coin.radar_breakout_ready})
-            entry_price = float(coin.entry_attempt_price or row.get("current_price") or 0.0)
+            entry_price = float(coin.entry_review_first_price or coin.entry_attempt_price or row.get("current_price") or 0.0)
             stop_price = float(coin.entry_stop_price or row.get("decision_stop_price") or 0.0)
             target_price = entry_price * 1.05 if entry_price else 0.0
             risk = entry_price - stop_price if entry_price and 0 < stop_price < entry_price else 0.0
@@ -1825,6 +1845,11 @@ class Scanner:
                 "review_stop_percent": round(pct(stop_price, entry_price), 2) if risk else None,
                 "review_target_price": round(target_price, 8) if target_price else None,
                 "review_rr": round(reward / risk, 2) if risk else None,
+                "champion_qualified": champion_qualified,
+                "champion_action": champion_action,
+                "champion_reason": champion_reason,
+                "entry_review_first_at_ms": coin.entry_review_first_at,
+                "entry_review_hold_until_ms": coin.entry_review_hold_until,
             })
             rows.append(row)
         stage_order = {"돌파 확인": 0, "소액 시도 가능": 1, "기다림": 2, "매수 금지": 3}
@@ -1835,14 +1860,14 @@ class Scanner:
             a_distance = pct(current, a_price) if a_price and current else None
             row["abc_current_distance"] = round(a_distance, 3) if a_distance is not None else None
             stage = str(row.get("abc_stage", ""))
-            row["entry_review"] = (
-                row.get("entry_cycle_state") in {"첫 시도", "재진입"}
-                or row.get("action") in {"소액 시도 가능", "돌파 확인"}
-            )
-            if row.get("entry_cycle_state") in {"첫 시도", "재진입"}:
-                row["entry_review_reason"] = row.get("entry_cycle_reason")
-            elif row["entry_review"]:
-                row["entry_review_reason"] = row.get("decision_reason")
+            held_review = bool(coin.entry_review_first_at and coin.entry_review_hold_until > now)
+            row["entry_review"] = bool(row.get("champion_qualified") or held_review)
+            row["entry_review_weakened"] = bool(held_review and not row.get("champion_qualified"))
+            row["entry_review_label"] = "조건 약화·관찰 유지" if row["entry_review_weakened"] else "챔피언 소액검토"
+            if row.get("champion_qualified"):
+                row["entry_review_reason"] = row.get("champion_reason")
+            elif row["entry_review_weakened"]:
+                row["entry_review_reason"] = "챔피언 조건 약화·최초 포착 후 60분 관찰 유지"
             elif row.get("entry_cycle_state") == "CONFIRM 재확인 대기":
                 row["entry_review_reason"] = "파란 CONFIRM 가격 눌림·재수급 대기"
             elif row.get("entry_cycle_state") == "단기 실패":
@@ -1889,7 +1914,7 @@ class Scanner:
             "detail_market_count": len(self.detail_codes),
             "scan_mode": "저비용 스윙 모드",
             "candidate_count": len(rows),
-            "buy_review_count": sum(row["action"] in {"소액 시도 가능", "돌파 확인"} for row in rows),
+            "buy_review_count": sum(bool(row.get("entry_review")) for row in rows),
             "champion_count": sum(row.get("detection_route") == "기존 수급" for row in rows),
             "challenger_count": sum(row.get("detection_route") == "A+수급" for row in rows),
             "btc_market": {**self.btc_swing_regime,
