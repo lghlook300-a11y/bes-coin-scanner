@@ -26,6 +26,7 @@ PERFORMANCE_FILE = DATA_DIR / "flow_performance.json"
 DAILY_COUNT_FILE = DATA_DIR / "daily_detection_counts_v2_5.json"
 DAILY_HISTORY_FILE = DATA_DIR / "daily_history_v2_8.json"
 EARLY_RADAR_FILE = DATA_DIR / "early_bottom_radar_v2_8.json"
+STAGE_HISTORY_FILE = DATA_DIR / "stage_history.json"
 STATIC_DIR = Path(__file__).with_name("static")
 STABLE = {"USDT", "USDC", "DAI", "TUSD", "FDUSD", "USDE", "PYUSD"}
 STATE_CONFIRM_MS = {
@@ -852,6 +853,16 @@ class Scanner:
         self.early_radar_records = self.load_early_radar()
         self.daily_counts = self.load_daily_counts()
         self.daily_history = self.load_daily_history()
+        try:
+            self.stage_history = json.loads(STAGE_HISTORY_FILE.read_text(encoding="utf-8"))
+            if not isinstance(self.stage_history, list):
+                self.stage_history = []
+        except (OSError, ValueError):
+            self.stage_history = []
+        self.last_dashboard_stage = {
+            item["market"]: item["stage"] for item in self.stage_history
+            if isinstance(item, dict) and item.get("market") and item.get("stage")
+        }
         self.active_session_key = kst_session_date(int(time.time() * 1000))
         for day_key in sorted(self.daily_counts):
             if day_key != self.active_session_key and day_key not in self.daily_history:
@@ -1630,6 +1641,9 @@ class Scanner:
             history_tmp = DAILY_HISTORY_FILE.with_suffix(".tmp")
             history_tmp.write_text(json.dumps(self.daily_history, ensure_ascii=False), encoding="utf-8")
             history_tmp.replace(DAILY_HISTORY_FILE)
+            stage_tmp = STAGE_HISTORY_FILE.with_suffix(".tmp")
+            stage_tmp.write_text(json.dumps(self.stage_history[-4000:], ensure_ascii=False), encoding="utf-8")
+            stage_tmp.replace(STAGE_HISTORY_FILE)
 
     def receive(self, payload: dict[str, Any]) -> None:
         code = str(payload.get("code", ""))
@@ -1860,7 +1874,7 @@ class Scanner:
             a_distance = pct(current, a_price) if a_price and current else None
             row["abc_current_distance"] = round(a_distance, 3) if a_distance is not None else None
             stage = str(row.get("abc_stage", ""))
-            held_review = bool(coin.entry_review_first_at and coin.entry_review_hold_until > now)
+            held_review = bool(row.get("entry_review_first_at_ms") and row.get("entry_review_hold_until_ms", 0) > now)
             row["entry_review"] = bool(row.get("champion_qualified") or held_review)
             row["entry_review_weakened"] = bool(held_review and not row.get("champion_qualified"))
             row["entry_review_label"] = "조건 약화·관찰 유지" if row["entry_review_weakened"] else "챔피언 소액검토"
@@ -1955,6 +1969,7 @@ class Scanner:
         if ready and due:
             self.published_snapshot = self._build_snapshot()
             self.published_at = now
+            self.record_dashboard_stages(self.published_snapshot, now)
 
         if self.published_snapshot is None:
             result = self._build_snapshot()
@@ -1971,6 +1986,38 @@ class Scanner:
         result["snapshot_at_ms"] = self.published_at
         result["next_snapshot_at_ms"] = self.published_at + DISPLAY_SNAPSHOT_MS
         return result
+
+    def record_dashboard_stages(self, snapshot: dict[str, Any], now: int) -> None:
+        """Keep the first confirmed price and time of each visible lane change."""
+        for row in snapshot.get("results", []):
+            market = row.get("market")
+            if not market:
+                continue
+            if row.get("entry_review"):
+                stage = "소액검토"
+            elif not row.get("chase") and (row.get("radar_stage") == "돌파 준비"
+                    or row.get("entry_cycle_state") in {"CONFIRM 재확인 대기", "재진입"}):
+                stage = "상승 준비"
+            elif not row.get("chase") and row.get("radar_stage") in {"바닥 준비 관찰", "A 초기 후보"}:
+                stage = "미리 관찰"
+            else:
+                continue
+            if self.last_dashboard_stage.get(market) == stage:
+                continue
+            coin = self.coins.get(market)
+            price = row.get("current_price")
+            ticker = self.light_tickers.get(market, {})
+            self.stage_history.append({
+                "market": market, "stage": stage,
+                "previous_stage": self.last_dashboard_stage.get(market),
+                "first_at_ms": now, "first_price": price,
+                "day_change_percent": round(float(ticker["signed_change_rate"]) * 100, 3)
+                if "signed_change_rate" in ticker else None,
+                "flow_first_at_ms": coin.flow_first_at if coin else None,
+                "flow_first_price": coin.flow_first_price if coin else None,
+            })
+            self.last_dashboard_stage[market] = stage
+        self.stage_history = self.stage_history[-4000:]
 
 
 async def main() -> None:
@@ -1990,6 +2037,9 @@ async def main() -> None:
         app.router.add_get("/api/early-radar-performance", lambda _: web.json_response({
             "engine": "BES V2.8 Early Bottom Radar 1",
             "records": scanner.early_radar_records[-4000:],
+        }))
+        app.router.add_get("/api/stage-history", lambda _: web.json_response({
+            "records": scanner.stage_history[-4000:],
         }))
         app.router.add_get("/health", lambda _: web.json_response({"ok": scanner.connected, "markets": len(scanner.coins)}))
         app.router.add_static("/", STATIC_DIR, show_index=True)
