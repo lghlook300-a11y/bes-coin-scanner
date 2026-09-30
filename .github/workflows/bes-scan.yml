@@ -3,7 +3,12 @@ name: BES Coin Scanner
 on:
   workflow_dispatch:
   schedule:
-          - cron: "2,17,32,47 * * * *"
+    - cron: "2,17,32,47 * * * *"
+  push:
+    branches: [main]
+    paths:
+      - 'bes-coin-scanner-upload/scanner.py'
+      - '.github/workflows/bes-scan.yml'
 
 permissions:
   contents: write
@@ -16,24 +21,34 @@ jobs:
   scan:
     runs-on: ubuntu-latest
     timeout-minutes: 90
-
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-
-      - name: Scan Upbit KRW markets
+          python-version: '3.12'
+      - name: Scan Bithumb KRW markets
         run: python bes-coin-scanner-upload/scanner.py
-
-      - name: Save result
+      - name: Report recording health
         run: |
-          if [ -z "$(git status --porcelain -- data/latest.json)" ]; then
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          d = json.loads(Path('data/latest.json').read_text())
+          h = d.get('recording_health', {})
+          gap = h.get('gap_minutes')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out:
+              out.write(f"Saved: {d.get('updated_at')}\n\nPrevious save gap: {gap} minutes\n\n")
+              out.write('Legacy outcome: +10%/-5% within 12h; validation: +5%/-3% within 24h.\n')
+          if h.get('gap_detected'):
+              print(f'::warning::Previous recording gap was {gap} minutes; missed detections were not reconstructed.')
+          PY
+      - name: Save actual records
+        run: |
+          git add data/latest.json data/watch_state.json data/validation/
+          if git diff --cached --quiet; then
             exit 0
           fi
-          git config user.name "bes-scanner-bot"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data/latest.json
-          git commit -m "Update BES coin signals"
+          git config user.name 'bes-scanner-bot'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Update BES coin signals and validation records'
           git push

@@ -176,10 +176,12 @@ def scan_market(market: str, ticker: dict[str, Any]) -> dict[str, Any]:
         "_tracking_bars": [
             {
                 "time": row["candle_date_time_utc"] + "Z",
+                "close": float(row["trade_price"]),
                 "high": float(row["high_price"]),
                 "low": float(row["low_price"]),
             }
-            for row in candles[-50:]
+            # Include the entire 24h validation window, even after a 12h outcome.
+            for row in candles[-125:]
         ],
     }
 
@@ -658,13 +660,16 @@ def public_row(row: dict[str, Any]) -> dict[str, Any]:
 def tracking_extremes(
     row: dict[str, Any], first_dt: datetime, first_price: float
 ) -> tuple[float, float, str | None, str | None]:
-    peak = pct_change(float(row["current_price"]), first_price)
-    mae = peak
+    # Outcome thresholds apply only to closed candles within the first 12h.
+    # A later live ticker price must never turn an expired episode into a win.
+    peak = 0.0
+    mae = 0.0
     success_at: str | None = None
     failure_at: str | None = None
     for bar in row.get("_tracking_bars", []):
         bar_dt = parse_utc(bar.get("time"))
-        if bar_dt is None or bar_dt < first_dt or bar_dt > first_dt + timedelta(hours=TRACK_HOURS):
+        if (bar_dt is None or bar_dt < first_dt
+                or bar_dt + timedelta(minutes=15) > first_dt + timedelta(hours=TRACK_HOURS)):
             continue
         high_return = pct_change(float(bar["high"]), first_price)
         low_return = pct_change(float(bar["low"]), first_price)
@@ -685,31 +690,114 @@ def validation_barrier(
 ) -> dict[str, Any]:
     """Evaluate +5% versus -3% from recorded OHLC; ties are marked, not guessed."""
     end_dt = first_dt + timedelta(hours=VALIDATION_HOURS)
-    for bar in row.get("_tracking_bars", []):
+    for bar in sorted(row.get("_tracking_bars", []), key=lambda b: str(b.get("time", ""))):
         bar_dt = parse_utc(bar.get("time"))
-        if bar_dt is None or bar_dt < first_dt or bar_dt > end_dt:
+        if (bar_dt is None or bar_dt < first_dt
+                or bar_dt + timedelta(minutes=15) > end_dt):
             continue
+        observed_at = (bar_dt + timedelta(minutes=15)).isoformat().replace("+00:00", "Z")
         hit_up = pct_change(float(bar["high"]), first_price) >= 5.0
         hit_down = pct_change(float(bar["low"]), first_price) <= -3.0
         if hit_up and hit_down:
-            return {"result": "동일 봉 동시 도달·순서 미확정", "observed_at": bar.get("time")}
+            return {"result": "동일 봉 동시 도달·순서 미확정", "observed_at": observed_at}
         if hit_up:
-            return {"result": "+5% 선도달", "observed_at": bar.get("time")}
+            return {"result": "+5% 선도달", "observed_at": observed_at}
         if hit_down:
-            return {"result": "-3% 선도달", "observed_at": bar.get("time")}
+            return {"result": "-3% 선도달", "observed_at": observed_at}
     return {"result": "미도달", "observed_at": None}
 
 
-def update_forward_returns(
-    prior: Any, elapsed_hours: float, current_return: float
-) -> dict[str, Any]:
-    """Persist the first scan observed after each requested validation horizon."""
-    values = dict(prior) if isinstance(prior, dict) else {}
+def forward_observations(
+    row: dict[str, Any], first_dt: datetime, first_price: float,
+    prior: dict[str, Any] | None = None,
+) -> tuple[dict[str, float], dict[str, dict[str, Any]]]:
+    """Use the first *closed* 15m candle near each target, never the scan price.
+
+    Missing candles or a gap exceeding 30 minutes leave the horizon unmeasured.
+    Legacy scan-time values are intentionally replaced, not silently carried over.
+    """
+    previous = prior or {}
+    old_returns = previous.get("forward_returns", {})
+    old_times = previous.get("forward_observation_times", {})
+    evidence: dict[str, dict[str, Any]] = dict(old_times) if isinstance(old_times, dict) else {}
+    # Only preserve old returns when accompanied by a candle timestamp. The
+    # previous scanner's scan-time numbers had no timestamp and are discarded.
+    returns = {
+        key: value for key, value in (old_returns.items() if isinstance(old_returns, dict) else [])
+        if key in evidence and evidence[key].get("candle_closed_at")
+    }
+    bars = row.get("_tracking_bars", [])
     for hours in (3, 6, 12, 24):
         key = f"{hours}h"
-        if elapsed_hours >= hours and key not in values:
-            values[key] = round(current_return, 4)
-    return values
+        if key in returns:
+            continue
+        target = first_dt + timedelta(hours=hours)
+        matching = []
+        for bar in bars:
+            opened = parse_utc(bar.get("time"))
+            if opened is None or "close" not in bar:
+                continue
+            closed = opened + timedelta(minutes=15)
+            if target <= closed <= target + timedelta(minutes=30):
+                matching.append((closed, bar))
+        if matching:
+            closed, bar = min(matching, key=lambda item: item[0])
+            returns[key] = round(pct_change(float(bar["close"]), first_price), 4)
+            evidence[key] = {
+                "candle_closed_at": closed.isoformat().replace("+00:00", "Z"),
+                "minutes_after_target": round((closed - target).total_seconds() / 60, 2),
+            }
+    return returns, evidence
+
+
+def validation_extremes(
+    row: dict[str, Any], first_dt: datetime, first_price: float,
+    prior: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Measure closed full candles inside 24h, separately from 12h outcomes."""
+    previous = (prior or {}).get("validation_extremes_24h", {})
+    if isinstance(previous, dict) and previous.get("complete"):
+        return previous
+    bars = []
+    for bar in row.get("_tracking_bars", []):
+        opened = parse_utc(bar.get("time"))
+        if (opened is not None and first_dt <= opened
+                and opened + timedelta(minutes=15) <= first_dt + timedelta(hours=24)):
+            bars.append((opened, bar))
+    if not bars:
+        return {"peak_percent": None, "mae_percent": None, "last_candle_closed_at": None,
+                "complete": False}
+    bars.sort(key=lambda item: item[0])
+    last_closed = max(opened for opened, _ in bars) + timedelta(minutes=15)
+    closes = [opened + timedelta(minutes=15) for opened, _ in bars]
+    continuous = (
+        closes[0] <= first_dt + timedelta(minutes=30)
+        and all(right - left <= timedelta(minutes=30) for left, right in zip(closes, closes[1:]))
+    )
+    # Sparse candles are visible, but their extrema cannot certify a full 24h window.
+    return {
+        "peak_percent": round(max(pct_change(float(bar["high"]), first_price) for _, bar in bars), 4),
+        "mae_percent": round(min(pct_change(float(bar["low"]), first_price) for _, bar in bars), 4),
+        "last_candle_closed_at": last_closed.isoformat().replace("+00:00", "Z"),
+        "partial_edge_candles_excluded": True,
+        # First/last partial candles are excluded; at most 15m of each edge is unknown.
+        "complete": continuous and last_closed >= first_dt + timedelta(hours=24, minutes=-15),
+    }
+
+
+def candle_coverage(row: dict[str, Any], first_dt: datetime, end_dt: datetime) -> bool:
+    """Require near-contiguous closed 15m candles before declaring an outcome."""
+    closes = sorted(
+        opened + timedelta(minutes=15)
+        for bar in row.get("_tracking_bars", [])
+        if (opened := parse_utc(bar.get("time"))) is not None
+        and first_dt <= opened and opened + timedelta(minutes=15) <= end_dt
+    )
+    return bool(closes) and (
+        closes[0] <= first_dt + timedelta(minutes=30)
+        and closes[-1] >= end_dt - timedelta(minutes=15)
+        and all(right - left <= timedelta(minutes=30) for left, right in zip(closes, closes[1:]))
+    )
 
 
 def missed_diagnostic(row: dict[str, Any], memory: dict[str, Any] | None) -> dict[str, Any]:
@@ -1134,6 +1222,46 @@ def update_paper_league(
     }
 
 
+def record_validation_snapshot(result: dict[str, Any], now: datetime) -> None:
+    """Append actual scan evidence; never manufacture scans in a missed interval."""
+    try:
+        previous = json.loads(OUT.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        previous = {}
+    previous_at = parse_utc(previous.get("updated_at"))
+    gap = (now - previous_at).total_seconds() / 60 if previous_at else None
+    result["recording_health"] = {
+        "previous_saved_at": previous.get("updated_at"),
+        "gap_minutes": round(gap, 2) if gap is not None else None,
+        "gap_detected": gap > 30 if gap is not None else None,
+        "expected_interval_minutes": 15,
+        "stale_after_minutes": 30,
+        "method": "closed_15m_v2; horizon prices are candle closes, not exact-time trades",
+        "performance_rules": {"legacy": "+10%/-5%, 12h", "validation": "+5%/-3%, 24h"},
+    }
+    fields = ("market", "first_detected_at", "first_detected_price", "initial_stage",
+              "stage", "action", "engine_version", "detection_route", "validation_method",
+              "forward_returns", "forward_observation_times", "barrier_5_or_3",
+              "validation_extremes_24h", "status", "entry_quality")
+    records = {}
+    for group in ("new_signals", "tracking", "completed"):
+        for row in result.get(group, []):
+            first = parse_utc(row.get("first_detected_at"))
+            if first is None or now - first > timedelta(hours=30):
+                continue
+            records[(row.get("market"), row.get("first_detected_at"))] = {
+                field: row.get(field) for field in fields
+            }
+    archive = OUT.parent / "validation" / (now.strftime("%Y-%m-%d") + ".jsonl")
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    with archive.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"saved_at": result["updated_at"],
+            "recording_health": result["recording_health"], "records": list(records.values()),
+            "missed_leaders": result.get("missed_leaders", []),
+            "late_surges": [{"market": r.get("market"), "change_12h": r.get("change_12h")}
+                            for r in result.get("late_surges", [])]}, ensure_ascii=False) + "\n")
+
+
 def main() -> None:
     markets_raw = api_get("/market/all", {"isDetails": "true"})
     risk_exclusions = [
@@ -1219,8 +1347,8 @@ def main() -> None:
         first_price = max(float(prior.get("first_detected_price", row["current_price"])), 1e-12)
         current_return = pct_change(float(row["current_price"]), first_price)
         observed_peak, observed_mae, success_at, failure_at = tracking_extremes(row, first_dt, first_price)
-        peak = max(float(prior.get("peak_return_since_detection", current_return)), observed_peak)
-        mae = min(float(prior.get("mae_since_detection", current_return)), observed_mae)
+        peak = max(float(prior.get("peak_return_since_detection", 0.0)), observed_peak)
+        mae = min(float(prior.get("mae_since_detection", 0.0)), observed_mae)
         elapsed_hours = max(0.0, (now - first_dt).total_seconds() / 3600.0)
 
         first_change = float(prior.get("first_detected_change_12h", prior.get("change_12h", 0.0)))
@@ -1238,10 +1366,12 @@ def main() -> None:
         else:
             current_action = "관찰"
 
+        forward_returns, forward_times = forward_observations(row, first_dt, first_price, prior)
         episode = {
             **public_row(row),
             "first_detected_at": prior.get("first_detected_at"),
             "first_detected_price": first_price,
+            "initial_stage": prior.get("initial_stage"),
             "first_detected_change_12h": first_change,
             "return_since_detection": round(current_return, 4),
             "peak_return_since_detection": round(peak, 4),
@@ -1255,13 +1385,25 @@ def main() -> None:
             "action": current_action,
             "detection_route": prior.get("detection_route", qualified_routes.get(market, "V3 이관")),
             "engine_version": prior.get("engine_version", "LEGACY"),
-            "forward_returns": update_forward_returns(
-                prior.get("forward_returns"), elapsed_hours, current_return
-            ),
+            "validation_method": prior.get("validation_method", "legacy_scan_v1"),
+            "forward_returns": forward_returns,
+            "forward_observation_times": forward_times,
+            "validation_extremes_24h": validation_extremes(row, first_dt, first_price, prior),
             "barrier_5_or_3": validation_barrier(row, first_dt, first_price),
         }
 
-        if failure_at and (not success_at or failure_at == success_at):
+        event_open = parse_utc(failure_at or success_at)
+        outcome_end = min(
+            first_dt + timedelta(hours=TRACK_HOURS),
+            event_open + timedelta(minutes=15) if event_open else first_dt + timedelta(hours=TRACK_HOURS),
+        )
+        verified = episode["validation_method"] == "closed_15m_v2"
+        coverage = candle_coverage(row, first_dt, outcome_end) if verified else None
+        episode["outcome_window_covered"] = coverage
+        if verified and not coverage and (event_open or elapsed_hours >= TRACK_HOURS):
+            episode.update({"status": "기록 부족", "completed_at": now_iso,
+                            "verification_reason": "15분봉 관측 공백"})
+        elif failure_at and (not success_at or failure_at == success_at):
             episode.update({"status": "실패", "completed_at": failure_at, "failure_reason": "-5% 선도달"})
         elif success_at:
             episode.update({"status": "성공", "completed_at": success_at, "success_reason": "+10% 선도달"})
@@ -1289,6 +1431,7 @@ def main() -> None:
             continue
         first_price = max(float(prior.get("first_detected_price", row["current_price"])), 1e-12)
         item = {**prior, **public_row(row)}
+        item["validation_method"] = prior.get("validation_method", "legacy_scan_v1")
         item["return_at_completion"] = prior.get(
             "return_at_completion", prior.get("return_since_detection")
         )
@@ -1300,10 +1443,20 @@ def main() -> None:
         if first_dt is not None:
             elapsed_hours = max(0.0, (now - first_dt).total_seconds() / 3600.0)
             current_return = pct_change(float(row["current_price"]), first_price)
-            item["forward_returns"] = update_forward_returns(
-                prior.get("forward_returns"), elapsed_hours, current_return
+            item["forward_returns"], item["forward_observation_times"] = forward_observations(
+                row, first_dt, first_price, prior
             )
-            item["barrier_5_or_3"] = validation_barrier(row, first_dt, first_price)
+            item["validation_extremes_24h"] = validation_extremes(row, first_dt, first_price, prior)
+            # The candle API retains a rolling window. Do not erase an earlier hit
+            # when the original observation period has fallen out of that window.
+            latest_barrier = validation_barrier(row, first_dt, first_price)
+            old_barrier = prior.get("barrier_5_or_3", {})
+            old_at = parse_utc(old_barrier.get("observed_at")) if isinstance(old_barrier, dict) else None
+            new_at = parse_utc(latest_barrier.get("observed_at"))
+            item["barrier_5_or_3"] = (
+                old_barrier if old_at is not None and (new_at is None or old_at <= new_at)
+                else latest_barrier
+            )
         refreshed_completed.append(item)
     completed = refreshed_completed
 
@@ -1335,6 +1488,7 @@ def main() -> None:
             **public_row(row),
             "first_detected_at": now_iso,
             "first_detected_price": first_price,
+            "initial_stage": row.get("stage"),
             "first_detected_change_12h": chase_risk,
             "return_since_detection": 0.0,
             "peak_return_since_detection": 0.0,
@@ -1345,11 +1499,17 @@ def main() -> None:
             "action": "추격 차단" if chase_reasons else str(watch_by_market[market]["action"]),
             "detection_route": qualified_routes[market],
             "engine_version": "V5.2",
+            "validation_method": "closed_15m_v2",
             "first_watch_at": watch_by_market[market]["first_watch_at"],
             "first_watch_price": watch_by_market[market]["first_watch_price"],
             "initial_research_snapshot": initial_research_snapshot(row, btc_context),
             "chase_risk_reasons": chase_reasons,
             "forward_returns": {},
+            "forward_observation_times": {},
+            "validation_extremes_24h": {
+                "peak_percent": None, "mae_percent": None,
+                "last_candle_closed_at": None, "complete": False,
+            },
             "barrier_5_or_3": {"result": "미도달", "observed_at": None},
         }
         tracking.append(episode)
@@ -1457,6 +1617,15 @@ def main() -> None:
     v5_failure = sum(row.get("status") == "실패" for row in v5_completed)
     v5_ongoing = sum(str(row.get("engine_version", "")).startswith("V5") for row in tracking)
     v5_win_rate = round(v5_success / (v5_success + v5_failure) * 100.0, 2) if v5_success + v5_failure else None
+    verified_completed = [
+        row for row in completed if row.get("validation_method") == "closed_15m_v2"
+    ]
+    verified_wins = sum(row.get("status") == "성공" for row in verified_completed)
+    verified_losses = sum(row.get("status") == "실패" for row in verified_completed)
+    verified_insufficient = sum(row.get("status") == "기록 부족" for row in verified_completed)
+    verified_ongoing = sum(
+        row.get("validation_method") == "closed_15m_v2" for row in tracking
+    )
     result = {
         "engine": "BES BTC-Gated Early V0.3",
         "mode": "추격 차단·V5.2 병행검증",
@@ -1485,6 +1654,17 @@ def main() -> None:
             "win_rate_percent": v5_win_rate,
             "rule": "+10% within 12h = success; -5% first or no +10% within 12h = failure",
         },
+        "performance_verified": {
+            "success_count": verified_wins,
+            "failure_count": verified_losses,
+            "insufficient_count": verified_insufficient,
+            "ongoing_count": verified_ongoing,
+            "win_rate_percent": (
+                round(verified_wins / (verified_wins + verified_losses) * 100.0, 2)
+                if verified_wins + verified_losses else None
+            ),
+            "rule": "closed_15m_v2 episodes only; previous mixed-method counts are excluded",
+        },
         "risk_excluded_count": len(risk_exclusions),
         "monitor_count": len(market_monitor),
         "rotation_watch_count": len(rotation_watch),
@@ -1507,6 +1687,7 @@ def main() -> None:
         "exclusions": exclusions,
     }
     OUT.parent.mkdir(parents=True, exist_ok=True)
+    record_validation_snapshot(result, now)
     OUT.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     WATCH_STATE.write_text(
         json.dumps(
